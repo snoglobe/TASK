@@ -1,13 +1,9 @@
 compute_environment: LOCAL_MACHINE
 debug: false
 deepspeed_config:
-  deepspeed_multinode_launcher: standard
-  gradient_accumulation_steps: 8
-  offload_optimizer_device: none
-  offload_param_device: none
+  deepspeed_config_file: ds_config.json
   zero3_init_flag: true
   zero3_save_16bit_model: true
-  zero_stage: 3
 distributed_type: DEEPSPEED
 downcast_bf16: 'no'
 enable_cpu_affinity: false
