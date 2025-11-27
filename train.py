@@ -37,7 +37,7 @@ class TrainConfig:
     
     # Data
     data_path: str = "traces.processed.jsonl"
-    max_seq_length: int = 8192
+    max_seq_length: int = 32768  # Qwen3 supports 32k
     
     # Training
     output_dir: str = "./checkpoints"
@@ -93,6 +93,23 @@ def load_traces(data_path: str) -> list[dict]:
 
 def create_dataset(traces: list[dict], tokenizer, max_seq_length: int) -> Dataset:
     """Create tokenized dataset from traces."""
+    
+    # First pass: get true lengths without truncation
+    true_lengths = []
+    for trace in traces:
+        tokens = tokenizer(trace["text"], truncation=False, add_special_tokens=True)
+        true_lengths.append(len(tokens["input_ids"]))
+    
+    # Report truncation stats
+    truncated = sum(1 for l in true_lengths if l > max_seq_length)
+    if truncated > 0:
+        over_lengths = [l for l in true_lengths if l > max_seq_length]
+        print(f"\n⚠️  Truncation warning:")
+        print(f"   {truncated}/{len(traces)} traces exceed max_seq_length ({max_seq_length})")
+        print(f"   Max length: {max(true_lengths)}, Median: {sorted(true_lengths)[len(true_lengths)//2]}")
+        print(f"   Truncated lengths: min={min(over_lengths)}, max={max(over_lengths)}, avg={sum(over_lengths)//len(over_lengths)}")
+    else:
+        print(f"✓ No truncation needed (max trace: {max(true_lengths)} tokens)")
     
     def tokenize(examples):
         # Tokenize the text
