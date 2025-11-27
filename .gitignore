@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+.uv/
+
+# Generated data
+traces.jsonl
+traces.processed.jsonl
+batch_input.jsonl
+batch_output.jsonl
+data.jsonl
+scenarios.jsonl
+rendered/
+
+# Training
+checkpoints/
+*.pt
+*.safetensors
+wandb/
+runs/
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Secrets
+.env
+*.key
+

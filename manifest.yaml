@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: playground
+spec:
+  replicas: 1
+  serviceName: playground
+  selector:
+    matchLabels:
+      app: playground
+  template:
+    metadata:
+      labels:
+        app: playground
+    spec:
+      runtimeClassName: nvidia
+      # Container specification
+      containers:
+      - name: playground
+        image: ghcr.io/andromeda-ai/utility-box-docker:playground-latest
+        command: ["sleep", "infinity"]
+        resources:
+          requests:
+            cpu: "128"
+            memory: "1500Gi"
+            nvidia.com/gpu: "8"
+            rdma/hca_shared_devices_a: "8"
+          limits:
+            cpu: "128"
+            memory: "1500Gi"
+            nvidia.com/gpu: "8"
+            rdma/hca_shared_devices_a: "8"
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: steep-wind
+          mountPath: /mnt/steep-wind
+      # Volume definitions
+      volumes:
+      # Shared memory for performance
+      - name: shm
+        emptyDir:
+          medium: Memory
+      - name: steep-wind
+        persistentVolumeClaim:
+          claimName: steep-wind
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: playground
+spec:
+  clusterIP: None
+  selector:
+    app: playground
+
