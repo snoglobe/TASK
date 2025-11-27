@@ -25,7 +25,7 @@ from transformers import (
     AutoTokenizer,
     TrainingArguments,
     Trainer,
-    DataCollatorForLanguageModeling,
+    DataCollatorForSeq2Seq,
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
@@ -39,11 +39,11 @@ class TrainConfig:
     data_path: str = "traces.processed.jsonl"
     max_seq_length: int = 32768  # Qwen3 supports 32k
     
-    # Training
+    # Training (optimized for 8xH200 140GB)
     output_dir: str = "./checkpoints"
     num_train_epochs: int = 3
-    per_device_train_batch_size: int = 1
-    gradient_accumulation_steps: int = 8  # Effective batch = 1 * 8 * 8 GPUs = 64
+    per_device_train_batch_size: int = 4  # H200 can handle much more
+    gradient_accumulation_steps: int = 2  # Effective batch = 4 * 2 * 8 GPUs = 64
     learning_rate: float = 2e-5
     warmup_ratio: float = 0.03
     weight_decay: float = 0.01
@@ -243,10 +243,11 @@ def main():
     print(f"Dataset size: {len(dataset)}")
     print(f"Sample token lengths: {[len(dataset[i]['input_ids']) for i in range(min(5, len(dataset)))]}")
     
-    # Data collator
-    data_collator = DataCollatorForLanguageModeling(
+    # Data collator - handles padding for variable length sequences
+    data_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
-        mlm=False,
+        padding=True,
+        pad_to_multiple_of=8,  # Efficient for tensor cores
     )
     
     # Training arguments
