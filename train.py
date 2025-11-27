@@ -91,8 +91,24 @@ def load_traces(data_path: str) -> list[dict]:
     return traces
 
 
-def create_dataset(traces: list[dict], tokenizer, max_seq_length: int) -> Dataset:
-    """Create tokenized dataset from traces."""
+def create_dataset(traces: list[dict], tokenizer, max_seq_length: int, cache_dir: str = ".cache") -> Dataset:
+    """Create tokenized dataset from traces with caching."""
+    import hashlib
+    
+    # Create cache key from data + tokenizer + max_seq_length
+    cache_key = hashlib.md5(
+        f"{len(traces)}_{tokenizer.name_or_path}_{max_seq_length}".encode()
+    ).hexdigest()[:12]
+    cache_path = Path(cache_dir) / f"tokenized_{cache_key}"
+    
+    # Try to load from cache
+    if cache_path.exists():
+        print(f"✓ Loading tokenized dataset from cache: {cache_path}")
+        dataset = Dataset.load_from_disk(str(cache_path))
+        print(f"  Loaded {len(dataset)} samples")
+        return dataset
+    
+    print(f"Tokenizing dataset (will cache to {cache_path})...")
     
     # First pass: get true lengths without truncation
     true_lengths = []
@@ -137,6 +153,11 @@ def create_dataset(traces: list[dict], tokenizer, max_seq_length: int) -> Datase
     original_len = len(dataset)
     dataset = dataset.filter(lambda x: len(x["input_ids"]) > 100)
     print(f"Filtered {original_len - len(dataset)} short sequences")
+    
+    # Save to cache
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    dataset.save_to_disk(str(cache_path))
+    print(f"✓ Cached tokenized dataset to {cache_path}")
     
     return dataset
 
@@ -201,6 +222,7 @@ def main():
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
     parser.add_argument("--resume-from", type=str, help="Resume from specific checkpoint")
     parser.add_argument("--save-steps", type=int, default=500)
+    parser.add_argument("--cache-dir", type=str, default=".cache", help="Cache directory for tokenized data")
     args = parser.parse_args()
     
     # Build config
@@ -238,7 +260,7 @@ def main():
     
     # Load and prepare data
     traces = load_traces(config.data_path)
-    dataset = create_dataset(traces, tokenizer, config.max_seq_length)
+    dataset = create_dataset(traces, tokenizer, config.max_seq_length, args.cache_dir)
     
     print(f"Dataset size: {len(dataset)}")
     print(f"Sample token lengths: {[len(dataset[i]['input_ids']) for i in range(min(5, len(dataset)))]}")

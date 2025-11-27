@@ -19,6 +19,7 @@ rendered/
 
 # Training
 checkpoints/
+.cache/
 *.pt
 *.safetensors
 wandb/
