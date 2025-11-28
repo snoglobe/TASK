@@ -839,7 +839,7 @@ class LLMJudge:
     
     def __init__(
         self,
-        model: str = "Qwen/Qwen2.5-72B-Instruct",
+        model: str = "PrimeIntellect/INTELLECT-3",
         backend: str = "vllm",  # "vllm", "vllm_server", or "openai"
         api_key: Optional[str] = None,
         cache_dir: str = ".cache/judge",
