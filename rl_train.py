@@ -40,7 +40,7 @@ from typing import Optional
 
 import torch
 from datasets import Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 
 # Optional backends for LLM judge
@@ -55,6 +55,46 @@ try:
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
+
+# Dashboard for live training visualization
+try:
+    from dashboard import create_dashboard, TrainingDashboard
+    DASHBOARD_AVAILABLE = True
+except ImportError:
+    DASHBOARD_AVAILABLE = False
+
+
+class DashboardCallback(TrainerCallback):
+    """Callback to update dashboard with training stats."""
+    
+    def __init__(self, dashboard):
+        self.dashboard = dashboard
+        self._last_loss = 0.0
+        self._last_reward = 0.0
+    
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        """Called when trainer logs metrics."""
+        if self.dashboard is None or logs is None:
+            return
+        
+        loss = logs.get('loss', self._last_loss)
+        reward_mean = logs.get('reward_mean', logs.get('rewards/mean', self._last_reward))
+        
+        self._last_loss = loss
+        self._last_reward = reward_mean
+        
+        self.dashboard.update_stats(
+            step=state.global_step,
+            loss=loss,
+            reward_mean=reward_mean,
+        )
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        """Called at end of each step."""
+        if self.dashboard is None:
+            return
+        
+        self.dashboard.update_stats(step=state.global_step)
 
 
 # =============================================================================
@@ -1498,18 +1538,55 @@ class HybridRewardFunction:
         return stats
 
 
-# Global reward function instance (set in main)
+# Global instances (set in main)
 _reward_fn: Optional[HybridRewardFunction] = None
+_dashboard = None
+_step_counter = 0
 
 
 def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs) -> list[float]:
-    """Wrapper for GRPO trainer compatibility."""
-    global _reward_fn
+    """Wrapper for GRPO trainer compatibility with dashboard logging."""
+    global _reward_fn, _dashboard, _step_counter
+    
+    verifier = TaskVerifier()
+    
     if _reward_fn is None:
         # Fallback to basic verifier if not initialized
-        verifier = TaskVerifier()
         return [verifier.compute_reward(c)[0] for c in completions]
-    return _reward_fn(completions, prompts, **kwargs)
+    
+    # Get rewards with dashboard logging
+    rewards = []
+    for prompt, completion in zip(prompts, completions):
+        # Get verifier score and breakdown
+        verifier_score, verifier_breakdown = verifier.compute_reward(completion)
+        
+        # Get judge score if enabled
+        judge_score = None
+        if _reward_fn.judge and random.random() < _reward_fn.judge_rate:
+            judge_result = _reward_fn.judge.judge(prompt, completion)
+            if judge_result:
+                judge_score = sum(judge_result.values()) / len(judge_result) / 10.0  # Normalize to 0-1
+        
+        # Compute final reward
+        final_reward = verifier_score
+        if judge_score is not None:
+            final_reward += _reward_fn.judge_weight * (judge_score * 5 - 2.5)  # Scale judge to similar range
+        
+        rewards.append(final_reward)
+        
+        # Log to dashboard
+        if _dashboard is not None:
+            _step_counter += 1
+            _dashboard.log_generation(
+                step=_step_counter,
+                prompt=prompt,
+                output=completion,
+                verifier_score=verifier_score,
+                verifier_breakdown=verifier_breakdown,
+                judge_score=judge_score,
+            )
+    
+    return rewards
 
 
 # =============================================================================
@@ -1631,6 +1708,12 @@ def main():
     parser.add_argument("--prompt-tool-rate", type=float, default=0.6,
                         help="Fraction of generated prompts that include tools (0-1)")
     
+    # Dashboard
+    parser.add_argument("--dashboard", action="store_true",
+                        help="Enable live training dashboard (requires 'rich' library)")
+    parser.add_argument("--no-dashboard", action="store_true",
+                        help="Disable dashboard even if available")
+    
     args = parser.parse_args()
     
     config = RLConfig(
@@ -1681,6 +1764,17 @@ def main():
     else:
         print(f"LLM Judge: DISABLED (verifier only)")
     print("="*60)
+    
+    # Initialize dashboard if requested
+    global _dashboard
+    use_dashboard = args.dashboard or (DASHBOARD_AVAILABLE and not args.no_dashboard)
+    if use_dashboard:
+        if not DASHBOARD_AVAILABLE:
+            print("Warning: Dashboard requested but 'rich' not installed. Run: pip install rich")
+            _dashboard = None
+        else:
+            _dashboard = create_dashboard(use_rich=True)
+            print("\n✓ Dashboard enabled (live TUI)")
     
     # Initialize hybrid reward function
     print("\nInitializing reward function...")
@@ -1756,6 +1850,11 @@ def main():
         report_to="tensorboard",
     )
     
+    # Trainer callbacks
+    callbacks = []
+    if _dashboard:
+        callbacks.append(DashboardCallback(_dashboard))
+    
     # Trainer
     trainer = GRPOTrainer(
         model=model,
@@ -1763,13 +1862,26 @@ def main():
         train_dataset=dataset,
         processing_class=tokenizer,
         reward_funcs=reward_function_wrapper,
+        callbacks=callbacks if callbacks else None,
     )
     
     # Train
     print("\nStarting GRPO training...")
+    
+    # Start dashboard
+    total_steps = len(dataset) * config.num_train_epochs
+    if _dashboard:
+        _dashboard.start(total_steps=total_steps)
+    
     try:
         trainer.train()
+    except KeyboardInterrupt:
+        print("\n\nTraining interrupted by user")
     finally:
+        # Stop dashboard
+        if _dashboard:
+            _dashboard.stop()
+        
         # Print stats
         print("\n" + "="*60)
         print("Training Statistics")

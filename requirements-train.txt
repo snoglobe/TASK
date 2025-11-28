@@ -10,4 +10,5 @@ flash-attn>=2.5.0
 vllm>=0.6.0  # For local LLM judge
 tensorboard
 wandb  # optional, for experiment tracking
+rich>=13.0.0  # For training dashboard TUI
 
