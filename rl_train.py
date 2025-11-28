@@ -831,10 +831,10 @@ class LLMJudge:
     For distributed training (accelerate launch), use either:
     1. --judge-backend openai (simplest)
     2. --judge-backend vllm_server --judge-url http://localhost:8000
-       After starting server: vllm serve Qwen/Qwen2.5-72B-Instruct --tensor-parallel-size 6
+       After starting server: vllm serve PrimeIntellect/INTELLECT-3 --tensor-parallel-size 6
     
     For local models on H200 cluster:
-    - 6x H200 (846GB) can run Qwen2.5-72B-Instruct at BF16 or Llama-3.1-405B at FP8
+    - 6x H200 (846GB) can run PrimeIntellect/INTELLECT-3 at BF16 or Llama-3.1-405B at FP8
     """
     
     def __init__(
@@ -1273,19 +1273,22 @@ class PromptGenerator:
     def __init__(
         self,
         llm_instance=None,  # Can share vLLM instance with judge
-        model: str = "Qwen/Qwen2.5-72B-Instruct",
+        model: str = "PrimeIntellect/INTELLECT-3",
         backend: str = "vllm",
         api_key: Optional[str] = None,
         tensor_parallel_size: int = 6,
         dtype: str = "bfloat16",
+        server_url: Optional[str] = None,  # For vllm_server backend
     ):
         self.backend = backend
         self.model = model
+        self.client = None
+        self._llm = None
+        self._owns_llm = False
         
         if llm_instance is not None:
             # Share existing vLLM instance
             self._llm = llm_instance
-            self._owns_llm = False
         elif backend == "vllm":
             if not VLLM_AVAILABLE:
                 raise ImportError("vllm required for prompt generation")
@@ -1299,12 +1302,17 @@ class PromptGenerator:
                 max_model_len=4096,
             )
             self._owns_llm = True
+        elif backend == "vllm_server":
+            # Connect to external vLLM server via OpenAI-compatible API
+            if not OPENAI_AVAILABLE:
+                raise ImportError("openai package required for vllm_server backend")
+            base_url = server_url or "http://localhost:8000/v1"
+            print(f"[PromptGen] Connecting to vLLM server at {base_url}")
+            self.client = OpenAI(base_url=base_url, api_key="not-needed")
         elif backend == "openai":
             if not OPENAI_AVAILABLE:
                 raise ImportError("openai required")
             self.client = OpenAI(api_key=api_key) if api_key else OpenAI()
-            self._llm = None
-            self._owns_llm = False
         
         # Use guided JSON generation to enforce schema
         # This ensures tool param types are valid JSON Schema types
@@ -1432,7 +1440,8 @@ class PromptGenerator:
             complexity=complexity,
         )
         
-        if self.backend == "vllm" and self._llm:
+        if self._llm is not None:
+            # Use in-process vLLM
             prompt = f"""<|im_start|>system
 {PROMPT_GEN_SYSTEM}<|im_end|>
 <|im_start|>user
@@ -1441,7 +1450,8 @@ class PromptGenerator:
 """
             outputs = self._llm.generate([prompt], self._sampling_params)
             response_text = outputs[0].outputs[0].text
-        else:
+        elif self.client is not None:
+            # Use OpenAI-compatible API (openai or vllm_server)
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
@@ -1453,6 +1463,8 @@ class PromptGenerator:
                 max_tokens=512,
             )
             response_text = response.choices[0].message.content
+        else:
+            raise RuntimeError("PromptGenerator has no LLM or client configured")
         
         scenario = self._parse_scenario(response_text)
         if scenario:
@@ -1462,7 +1474,7 @@ class PromptGenerator:
     
     def generate_batch(self, n: int, **kwargs) -> list[str]:
         """Generate multiple prompts."""
-        if self.backend == "vllm" and self._llm:
+        if self._llm is not None:
             # Batch generation for efficiency
             prompts_to_gen = []
             for _ in range(n):
@@ -1515,7 +1527,7 @@ class HybridRewardFunction:
     def __init__(
         self,
         judge_rate: float = 0.0,  # Fraction of samples to judge (0 = disabled)
-        judge_model: str = "Qwen/Qwen2.5-72B-Instruct",
+        judge_model: str = "PrimeIntellect/INTELLECT-3",
         judge_backend: str = "vllm_server",  # "vllm_server", "vllm", or "openai"
         judge_weight: float = 1.0,  # Weight of LLM score vs verifier score
         judge_gpus: int = 6,  # GPUs for judge model
@@ -1690,7 +1702,7 @@ class RLConfig:
     
     # LLM Judge
     judge_rate: float = 0.0  # Fraction of samples to judge (0 = disabled)
-    judge_model: str = "Qwen/Qwen2.5-72B-Instruct"
+    judge_model: str = "PrimeIntellect/INTELLECT-3"
     judge_backend: str = "vllm_server"  # "vllm_server", "vllm", or "openai"
     judge_url: str = "http://localhost:8000/v1"  # URL for vllm_server
     judge_weight: float = 1.0  # Weight of LLM score vs verifier score
@@ -1734,7 +1746,7 @@ def main():
     # LLM Judge arguments
     parser.add_argument("--judge-rate", type=float, default=0.0,
                         help="Fraction of samples to evaluate with LLM judge (0=disabled, 0.1=10%%)")
-    parser.add_argument("--judge-model", type=str, default="Qwen/Qwen2.5-72B-Instruct",
+    parser.add_argument("--judge-model", type=str, default="PrimeIntellect/INTELLECT-3",
                         help="Model for LLM judge (HF model ID for vllm, or OpenAI model name)")
     parser.add_argument("--judge-backend", type=str, default="vllm_server", 
                         choices=["vllm", "vllm_server", "openai"],
@@ -1871,6 +1883,7 @@ def main():
             api_key=config.openai_api_key,
             tensor_parallel_size=config.judge_gpus,
             dtype=config.judge_dtype,
+            server_url=config.judge_url,
         )
         
         # Generate prompts
