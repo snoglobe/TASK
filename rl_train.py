@@ -823,9 +823,15 @@ Evaluate this response. JSON only:"""
 class LLMJudge:
     """LLM-as-a-judge for semantic quality evaluation.
     
-    Supports two backends:
+    Supports three backends:
     - "openai": Uses OpenAI API (requires openai package)
-    - "vllm": Uses local vLLM server (requires vllm package)
+    - "vllm": Uses local vLLM in-process (conflicts with distributed training!)
+    - "vllm_server": Connects to external vLLM server (recommended for distributed training)
+    
+    For distributed training (accelerate launch), use either:
+    1. --judge-backend openai (simplest)
+    2. --judge-backend vllm_server --judge-url http://localhost:8000
+       After starting server: vllm serve Qwen/Qwen2.5-72B-Instruct --tensor-parallel-size 6
     
     For local models on H200 cluster:
     - 6x H200 (846GB) can run Qwen2.5-72B-Instruct at BF16 or Llama-3.1-405B at FP8
@@ -834,12 +840,13 @@ class LLMJudge:
     def __init__(
         self,
         model: str = "Qwen/Qwen2.5-72B-Instruct",
-        backend: str = "vllm",  # "vllm" or "openai"
+        backend: str = "vllm",  # "vllm", "vllm_server", or "openai"
         api_key: Optional[str] = None,
         cache_dir: str = ".cache/judge",
         tensor_parallel_size: int = 6,  # Number of GPUs for judge
         gpu_memory_utilization: float = 0.9,
         dtype: str = "bfloat16",  # "bfloat16", "float16", "auto"
+        server_url: Optional[str] = None,  # For vllm_server backend
     ):
         self.model = model
         self.backend = backend
@@ -855,17 +862,45 @@ class LLMJudge:
                 raise ImportError("openai package required. Install with: pip install openai")
             self.client = OpenAI(api_key=api_key) if api_key else OpenAI()
             self._llm = None
+        
+        elif backend == "vllm_server":
+            # Connect to external vLLM server via OpenAI-compatible API
+            if not OPENAI_AVAILABLE:
+                raise ImportError("openai package required for vllm_server backend")
+            base_url = server_url or "http://localhost:8000/v1"
+            print(f"[Judge] Connecting to vLLM server at {base_url}")
+            self.client = OpenAI(base_url=base_url, api_key="not-needed")
+            self._llm = None
+            self._sampling_params = None
+            print(f"[Judge] Connected to vLLM server (model: {model})")
         elif backend == "vllm":
             if not VLLM_AVAILABLE:
                 raise ImportError("vllm package required. Install with: pip install vllm")
-            print(f"[Judge] Loading {model} on {tensor_parallel_size} GPUs...")
+            
+            # Check if running under accelerate/distributed - vLLM conflicts with it
+            is_distributed = os.environ.get("WORLD_SIZE") or os.environ.get("ACCELERATE_LAUNCHED")
+            if is_distributed:
+                print(f"[Judge] WARNING: Running under distributed training (accelerate/deepspeed)")
+                print(f"[Judge] vLLM tensor parallelism conflicts with training distributed backend")
+                print(f"[Judge] Options:")
+                print(f"         1. Use --judge-backend openai instead")
+                print(f"         2. Run vLLM as separate server: vllm serve {model}")
+                print(f"         3. Reduce --judge-gpus to 1 (single GPU, may OOM on large models)")
+                print(f"[Judge] Attempting single-GPU mode with reduced memory...")
+                tensor_parallel_size = 1
+                gpu_memory_utilization = 0.3  # Leave room for training
+            
+            print(f"[Judge] Loading {model} on {tensor_parallel_size} GPU(s)...")
+            
+            # Use enforce_eager to avoid CUDA graph conflicts
             self._llm = LLM(
                 model=model,
                 tensor_parallel_size=tensor_parallel_size,
                 gpu_memory_utilization=gpu_memory_utilization,
                 dtype=dtype,
                 trust_remote_code=False,
-                max_model_len=8192,  # Limit context for judge efficiency
+                max_model_len=4096,  # Reduced for memory
+                enforce_eager=True,  # Avoid CUDA graph conflicts with training
             )
             # Use guided JSON generation to enforce schema
             # vLLM uses guided_json parameter (dict or JSON string)
@@ -993,7 +1028,7 @@ class LLMJudge:
         user_request = self._extract_user_request(prompt)
         
         try:
-            if self.backend == "openai":
+            if self.backend in ("openai", "vllm_server"):
                 result = self._judge_openai(user_request, completion)
             else:
                 result = self._judge_vllm(user_request, completion)
@@ -1481,11 +1516,12 @@ class HybridRewardFunction:
         self,
         judge_rate: float = 0.0,  # Fraction of samples to judge (0 = disabled)
         judge_model: str = "Qwen/Qwen2.5-72B-Instruct",
-        judge_backend: str = "vllm",  # "vllm" or "openai"
+        judge_backend: str = "vllm_server",  # "vllm_server", "vllm", or "openai"
         judge_weight: float = 1.0,  # Weight of LLM score vs verifier score
         judge_gpus: int = 6,  # GPUs for judge model
         judge_dtype: str = "bfloat16",
         api_key: Optional[str] = None,
+        server_url: Optional[str] = None,  # URL for vllm_server backend
     ):
         self.verifier = TaskVerifier()
         self.judge_rate = judge_rate
@@ -1499,6 +1535,7 @@ class HybridRewardFunction:
                 api_key=api_key,
                 tensor_parallel_size=judge_gpus,
                 dtype=judge_dtype,
+                server_url=server_url,
             )
     
     def __call__(
@@ -1644,7 +1681,8 @@ class RLConfig:
     # LLM Judge
     judge_rate: float = 0.0  # Fraction of samples to judge (0 = disabled)
     judge_model: str = "Qwen/Qwen2.5-72B-Instruct"
-    judge_backend: str = "vllm"  # "vllm" for local, "openai" for API
+    judge_backend: str = "vllm_server"  # "vllm_server", "vllm", or "openai"
+    judge_url: str = "http://localhost:8000/v1"  # URL for vllm_server
     judge_weight: float = 1.0  # Weight of LLM score vs verifier score
     judge_gpus: int = 6  # GPUs for judge model (when using vllm)
     judge_dtype: str = "bfloat16"  # "bfloat16", "float16", "auto"
@@ -1688,8 +1726,11 @@ def main():
                         help="Fraction of samples to evaluate with LLM judge (0=disabled, 0.1=10%%)")
     parser.add_argument("--judge-model", type=str, default="Qwen/Qwen2.5-72B-Instruct",
                         help="Model for LLM judge (HF model ID for vllm, or OpenAI model name)")
-    parser.add_argument("--judge-backend", type=str, default="vllm", choices=["vllm", "openai"],
-                        help="Backend for LLM judge: 'vllm' (local) or 'openai' (API)")
+    parser.add_argument("--judge-backend", type=str, default="vllm_server", 
+                        choices=["vllm", "vllm_server", "openai"],
+                        help="Backend: 'vllm_server' (external server, recommended), 'vllm' (in-process, conflicts with distributed!), 'openai' (API)")
+    parser.add_argument("--judge-url", type=str, default="http://localhost:8000/v1",
+                        help="URL for vllm_server backend (default: http://localhost:8000/v1)")
     parser.add_argument("--judge-weight", type=float, default=1.0,
                         help="Weight of LLM judge score relative to verifier")
     parser.add_argument("--judge-gpus", type=int, default=6,
@@ -1729,6 +1770,7 @@ def main():
         judge_rate=args.judge_rate,
         judge_model=args.judge_model,
         judge_backend=args.judge_backend,
+        judge_url=args.judge_url,
         judge_weight=args.judge_weight,
         judge_gpus=args.judge_gpus,
         judge_dtype=args.judge_dtype,
@@ -1786,6 +1828,7 @@ def main():
         judge_gpus=config.judge_gpus,
         judge_dtype=config.judge_dtype,
         api_key=config.openai_api_key,
+        server_url=config.judge_url,
     )
     
     # Load model and tokenizer
