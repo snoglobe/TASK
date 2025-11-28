@@ -81,6 +81,12 @@ def generate(model, tokenizer, prompt: str, max_new_tokens: int = 4096, temperat
     """Generate a response."""
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     
+    # Get stop token IDs - both EOS and <|im_end|>
+    stop_token_ids = [tokenizer.eos_token_id]
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    if im_end_id != tokenizer.unk_token_id:
+        stop_token_ids.append(im_end_id)
+    
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
@@ -89,7 +95,7 @@ def generate(model, tokenizer, prompt: str, max_new_tokens: int = 4096, temperat
             do_sample=True,
             top_p=0.9,
             pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            eos_token_id=stop_token_ids,
         )
     
     response = tokenizer.decode(outputs[0], skip_special_tokens=False)
