@@ -1933,13 +1933,8 @@ def main():
     parser.add_argument("--openai-api-key", type=str, default=None,
                         help="OpenAI API key (for openai backend)")
     
-    # Dynamic prompt generation
-    parser.add_argument("--generate-prompts", action="store_true",
-                        help="Generate prompts on-the-fly instead of using data file")
-    parser.add_argument("--prompt-gen-count", type=int, default=1000,
-                        help="Number of prompts to generate (when --generate-prompts)")
-    parser.add_argument("--prompt-tool-rate", type=float, default=0.6,
-                        help="Fraction of generated prompts that include tools (0-1)")
+    # Note: For prompt generation, use generate_prompts.py separately
+    # This avoids NCCL timeout issues during distributed training
     
     # Dashboard
     parser.add_argument("--dashboard", action="store_true",
@@ -1967,9 +1962,6 @@ def main():
         judge_gpus=args.judge_gpus,
         judge_dtype=args.judge_dtype,
         openai_api_key=args.openai_api_key,
-        generate_prompts=args.generate_prompts,
-        prompt_gen_count=args.prompt_gen_count,
-        prompt_tool_rate=args.prompt_tool_rate,
     )
     
     print("="*60)
@@ -2036,80 +2028,17 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Load or generate prompts
-    # Only rank 0 generates/loads, then we broadcast to other ranks
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    # Load prompts from file
+    # For generating prompts, use generate_prompts.py first (avoids NCCL timeout)
+    print("\nLoading prompts from file...")
+    prompts = load_prompts(config.data_path, config.max_samples)
     
-    prompts = None
-    prompt_generator = None
-    
-    if local_rank == 0:
-        if config.generate_prompts:
-            print("\nGenerating prompts on-the-fly (rank 0 only)...")
-            # Create prompt generator
-            prompt_generator = PromptGenerator(
-                llm_instance=None,
-                model=config.judge_model,
-                backend=config.judge_backend,
-                api_key=config.openai_api_key,
-                tensor_parallel_size=config.judge_gpus,
-                dtype=config.judge_dtype,
-                server_url=config.judge_url,
-            )
-            
-            # Generate prompts in batches of 20 per API call
-            print(f"  Generating {config.prompt_gen_count} prompts (batches of 20)...")
-            generated = prompt_generator.generate_batch(
-                config.prompt_gen_count,
-                include_tools=None,
-                batch_size=20,  # Generate 20 scenarios per API call
-            )
-            prompts = [{"prompt": p} for p in generated]
-            print(f"  Generated {len(prompts)} valid prompts")
-            
-            # Save to temp file for other ranks
-            import tempfile
-            prompt_file = os.path.join(tempfile.gettempdir(), f"task_prompts_{os.getpid()}.json")
-            with open(prompt_file, 'w') as f:
-                json.dump(prompts, f)
-            print(f"  Saved to {prompt_file}")
-        else:
-            print("\nLoading prompts from file...")
-            prompts = load_prompts(config.data_path, config.max_samples)
-    
-    # Sync across ranks
-    if world_size > 1:
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
-        
-        if local_rank == 0:
-            # Broadcast prompt count
-            prompt_count = torch.tensor([len(prompts)], device="cuda")
-        else:
-            prompt_count = torch.tensor([0], device="cuda")
-        
-        dist.broadcast(prompt_count, src=0)
-        
-        if local_rank != 0:
-            # Load from temp file or original file
-            if config.generate_prompts:
-                import tempfile
-                # Find the prompt file from rank 0
-                prompt_file = os.path.join(tempfile.gettempdir(), f"task_prompts_{os.environ.get('MASTER_PID', os.getpid())}.json")
-                if os.path.exists(prompt_file):
-                    with open(prompt_file) as f:
-                        prompts = json.load(f)
-                else:
-                    # Fallback: generate our own (not ideal but works)
-                    print(f"  [Rank {local_rank}] Waiting for prompts...")
-                    import time
-                    time.sleep(5)
-                    prompts = load_prompts(config.data_path, config.max_samples) if not config.generate_prompts else []
-            else:
-                prompts = load_prompts(config.data_path, config.max_samples)
-        
-        dist.barrier()  # Ensure all ranks have prompts before continuing
+    if len(prompts) == 0:
+        print("ERROR: No prompts loaded!")
+        print("Generate prompts first with:")
+        print(f"  python generate_prompts.py --count 1000 --output prompts.jsonl")
+        print(f"Then run: accelerate launch rl_train.py --data prompts.jsonl")
+        return
     
     dataset = Dataset.from_list(prompts)
     
@@ -2165,10 +2094,6 @@ def main():
         print("\n" + "="*60)
         print("Training Statistics")
         print("="*60)
-        
-        if prompt_generator:
-            gen_stats = prompt_generator.stats()
-            print(f"Prompts generated: {gen_stats.get('generated', 0)}")
         
         if _reward_fn:
             stats = _reward_fn.get_stats()
