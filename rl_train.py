@@ -1341,6 +1341,9 @@ class PromptGenerator:
         With guided JSON generation, output should always be valid JSON.
         Fallbacks are for non-vLLM backends or edge cases.
         """
+        if not text:
+            return None
+        
         # With guided generation, this should always work
         try:
             scenario = json.loads(text)
@@ -1458,13 +1461,19 @@ class PromptGenerator:
                     {"role": "system", "content": PROMPT_GEN_SYSTEM},
                     {"role": "user", "content": user_msg}
                 ],
-                response_format={"type": "json_object"},
+                response_format={"type": "json_object"} if self.backend == "openai" else None,
                 temperature=0.9,
                 max_tokens=512,
             )
             response_text = response.choices[0].message.content
+            if response_text is None:
+                # Some models return content in a different field or as empty
+                return None
         else:
             raise RuntimeError("PromptGenerator has no LLM or client configured")
+        
+        if not response_text:
+            return None
         
         scenario = self._parse_scenario(response_text)
         if scenario:
@@ -1510,8 +1519,24 @@ class PromptGenerator:
             
             return results
         else:
-            # Sequential for OpenAI
-            return [p for p in (self.generate_one(**kwargs) for _ in range(n)) if p]
+            # Sequential for OpenAI/vllm_server with progress
+            results = []
+            failures = 0
+            for i in range(n):
+                if (i + 1) % 10 == 0:
+                    print(f"    Generated {len(results)}/{n} prompts ({failures} failures)...")
+                try:
+                    prompt = self.generate_one(**kwargs)
+                    if prompt:
+                        results.append(prompt)
+                    else:
+                        failures += 1
+                except Exception as e:
+                    failures += 1
+                    if failures <= 3:  # Only log first few failures
+                        print(f"    [PromptGen] Error: {e}")
+            print(f"    Done: {len(results)} prompts generated ({failures} failures)")
+            return results
     
     def stats(self) -> dict:
         return {'generated': self.generated}
