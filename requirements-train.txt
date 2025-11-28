@@ -1,10 +1,11 @@
-# Training dependencies for SFT
+# Training dependencies for SFT and RL
 torch>=2.2.0
 transformers>=4.47.0
 datasets>=2.18.0
 accelerate>=0.30.0
 deepspeed>=0.14.0
 peft>=0.14.0
+trl>=0.12.0  # For GRPO/PPO/DPO
 flash-attn>=2.5.0
 tensorboard
 wandb  # optional, for experiment tracking
