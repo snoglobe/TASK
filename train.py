@@ -39,11 +39,11 @@ class TrainConfig:
     data_path: str = "traces.processed.jsonl"
     max_seq_length: int = 32768  # Qwen3 supports 32k
     
-    # Training (optimized for 8xH200 140GB)
+    # Training (optimized for 8xH200 140GB with 32k context)
     output_dir: str = "./checkpoints"
     num_train_epochs: int = 3
-    per_device_train_batch_size: int = 4  # H200 can handle much more
-    gradient_accumulation_steps: int = 2  # Effective batch = 4 * 2 * 8 GPUs = 64
+    per_device_train_batch_size: int = 2  # Should fit easily on H200
+    gradient_accumulation_steps: int = 4  # Effective batch = 2 * 4 * 8 GPUs = 64
     learning_rate: float = 2e-5
     warmup_ratio: float = 0.03
     weight_decay: float = 0.01
@@ -71,6 +71,7 @@ class TrainConfig:
     
     # Logging
     logging_steps: int = 10
+    logging_first_step: bool = True
     report_to: str = "tensorboard"
     
     # Resume
@@ -179,16 +180,27 @@ def setup_model_and_tokenizer(config: TrainConfig):
         tokenizer.pad_token = tokenizer.eos_token
     
     # Load model
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_name,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
-        attn_implementation="flash_attention_2",
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
+            attn_implementation="flash_attention_2",
+        )
+        print("✓ Using Flash Attention 2")
+    except Exception as e:
+        print(f"⚠️  Flash Attention 2 failed ({e}), falling back to SDPA")
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
+            attn_implementation="sdpa",
+        )
     
     # Enable gradient checkpointing
     if config.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        print("✓ Gradient checkpointing enabled")
     
     # Apply LoRA if enabled
     if config.use_lora:
@@ -289,6 +301,7 @@ def main():
         save_steps=config.save_steps,
         save_total_limit=config.save_total_limit,
         logging_steps=config.logging_steps,
+        logging_first_step=config.logging_first_step,
         report_to=config.report_to,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
