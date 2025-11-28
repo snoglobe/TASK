@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
@@ -1522,8 +1523,13 @@ class PromptGenerator:
             print(f"    [PromptGen] Failed to parse: {preview}...")
         return None
     
-    def generate_batch(self, n: int, **kwargs) -> list[str]:
-        """Generate multiple prompts."""
+    def generate_batch(self, n: int, batch_size: int = 20, **kwargs) -> list[str]:
+        """Generate multiple prompts.
+        
+        Args:
+            n: Total number of prompts to generate
+            batch_size: Number of scenarios to request per API call (default 20)
+        """
         if self._llm is not None:
             # Batch generation for efficiency
             prompts_to_gen = []
@@ -1560,25 +1566,122 @@ class PromptGenerator:
             
             return results
         else:
-            # Sequential for OpenAI/vllm_server with progress
+            # Use batch API calls for OpenAI/vllm_server
             results = []
             failures = 0
-            for i in range(n):
+            num_batches = (n + batch_size - 1) // batch_size
+            
+            for batch_idx in range(num_batches):
+                remaining = n - len(results)
+                current_batch_size = min(batch_size, remaining)
+                
+                print(f"    [Batch {batch_idx+1}/{num_batches}] Requesting {current_batch_size} scenarios...")
+                
                 try:
-                    prompt = self.generate_one(**kwargs)
-                    if prompt:
-                        results.append(prompt)
-                        # Log each successful prompt (truncated)
-                        preview = prompt[:150].replace('\n', ' ')
-                        print(f"    [{len(results)}/{n}] ✓ {preview}...")
-                    else:
-                        failures += 1
-                        print(f"    [{i+1}/{n}] ✗ Failed to parse response")
+                    batch_results = self._generate_batch_api(current_batch_size, **kwargs)
+                    for prompt in batch_results:
+                        if prompt:
+                            results.append(prompt)
+                            preview = prompt[:100].replace('\n', ' ')
+                            print(f"      [{len(results)}/{n}] ✓ {preview}...")
+                    
+                    batch_failures = current_batch_size - len(batch_results)
+                    if batch_failures > 0:
+                        failures += batch_failures
+                        print(f"      {batch_failures} failed to parse in this batch")
+                        
                 except Exception as e:
-                    failures += 1
-                    print(f"    [{i+1}/{n}] ✗ Error: {e}")
+                    failures += current_batch_size
+                    print(f"      Batch failed: {e}")
+                
+                if len(results) >= n:
+                    break
+            
             print(f"    Done: {len(results)} prompts generated ({failures} failures)")
-            return results
+            return results[:n]  # Trim to exact count
+    
+    def _generate_batch_api(self, batch_size: int, **kwargs) -> list[str]:
+        """Generate multiple scenarios in a single API call."""
+        if self.client is None:
+            raise RuntimeError("No client configured for batch API generation")
+        
+        # Build prompt asking for multiple scenarios
+        domain = kwargs.get('domain') or random.choice(self.DOMAINS)
+        include_tools = kwargs.get('include_tools')
+        if include_tools is None:
+            include_tools = random.random() < 0.6
+        complexity = kwargs.get('complexity') or random.choice(self.COMPLEXITIES)
+        
+        batch_prompt = f"""Generate {batch_size} diverse training scenarios. Return a JSON array.
+
+Requirements for ALL scenarios:
+- Domain: vary between {', '.join(self.DOMAINS)}
+- Include tools: vary (some with 1-3 tools, some without)
+- Complexity: vary between simple, medium, complex
+- Make each scenario DIFFERENT from the others
+
+Return ONLY a JSON array like:
+[
+  {{"system_prompt": "...", "tools": [...], "user_request": "...", "domain": "...", "complexity": "..."}},
+  {{"system_prompt": "...", "tools": [], "user_request": "...", "domain": "...", "complexity": "..."}},
+  ...
+]
+
+{batch_size} scenarios, JSON array only:"""
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": PROMPT_GEN_SYSTEM},
+                    {"role": "user", "content": batch_prompt}
+                ],
+                temperature=0.9,
+                max_tokens=batch_size * 300,  # ~300 tokens per scenario
+            )
+        except Exception as e:
+            print(f"    [PromptGen] API error: {e}")
+            return []
+        
+        response_text = response.choices[0].message.content if response.choices else None
+        if not response_text:
+            print(f"    [PromptGen] Empty response")
+            return []
+        
+        # Parse JSON array
+        try:
+            # Try direct parse
+            scenarios = json.loads(response_text)
+        except json.JSONDecodeError:
+            # Try to extract array from response
+            match = re.search(r'\[[\s\S]*\]', response_text)
+            if match:
+                try:
+                    scenarios = json.loads(match.group(0))
+                except:
+                    print(f"    [PromptGen] Failed to parse array: {response_text[:200]}...")
+                    return []
+            else:
+                print(f"    [PromptGen] No array found: {response_text[:200]}...")
+                return []
+        
+        if not isinstance(scenarios, list):
+            print(f"    [PromptGen] Response is not an array")
+            return []
+        
+        # Format each scenario
+        results = []
+        for scenario in scenarios:
+            try:
+                if isinstance(scenario, dict) and 'system_prompt' in scenario and 'user_request' in scenario:
+                    formatted = self._format_prompt(scenario)
+                    if formatted:
+                        results.append(formatted)
+                        self.generated += 1
+            except Exception as e:
+                pass  # Skip malformed scenarios
+        
+        return results
     
     def stats(self) -> dict:
         return {'generated': self.generated}
@@ -1934,36 +2037,79 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     
     # Load or generate prompts
+    # Only rank 0 generates/loads, then we broadcast to other ranks
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    
+    prompts = None
     prompt_generator = None
-    if config.generate_prompts:
-        print("\nGenerating prompts on-the-fly...")
-        # Create prompt generator (can share LLM with judge if both use vllm)
-        llm_instance = None
-        if _reward_fn and _reward_fn.judge and hasattr(_reward_fn.judge, '_llm'):
-            llm_instance = _reward_fn.judge._llm
-            print("  (sharing LLM instance with judge)")
+    
+    if local_rank == 0:
+        if config.generate_prompts:
+            print("\nGenerating prompts on-the-fly (rank 0 only)...")
+            # Create prompt generator
+            prompt_generator = PromptGenerator(
+                llm_instance=None,
+                model=config.judge_model,
+                backend=config.judge_backend,
+                api_key=config.openai_api_key,
+                tensor_parallel_size=config.judge_gpus,
+                dtype=config.judge_dtype,
+                server_url=config.judge_url,
+            )
+            
+            # Generate prompts in batches of 20 per API call
+            print(f"  Generating {config.prompt_gen_count} prompts (batches of 20)...")
+            generated = prompt_generator.generate_batch(
+                config.prompt_gen_count,
+                include_tools=None,
+                batch_size=20,  # Generate 20 scenarios per API call
+            )
+            prompts = [{"prompt": p} for p in generated]
+            print(f"  Generated {len(prompts)} valid prompts")
+            
+            # Save to temp file for other ranks
+            import tempfile
+            prompt_file = os.path.join(tempfile.gettempdir(), f"task_prompts_{os.getpid()}.json")
+            with open(prompt_file, 'w') as f:
+                json.dump(prompts, f)
+            print(f"  Saved to {prompt_file}")
+        else:
+            print("\nLoading prompts from file...")
+            prompts = load_prompts(config.data_path, config.max_samples)
+    
+    # Sync across ranks
+    if world_size > 1:
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
         
-        prompt_generator = PromptGenerator(
-            llm_instance=llm_instance,
-            model=config.judge_model,
-            backend=config.judge_backend,
-            api_key=config.openai_api_key,
-            tensor_parallel_size=config.judge_gpus,
-            dtype=config.judge_dtype,
-            server_url=config.judge_url,
-        )
+        if local_rank == 0:
+            # Broadcast prompt count
+            prompt_count = torch.tensor([len(prompts)], device="cuda")
+        else:
+            prompt_count = torch.tensor([0], device="cuda")
         
-        # Generate prompts
-        print(f"  Generating {config.prompt_gen_count} prompts...")
-        generated = prompt_generator.generate_batch(
-            config.prompt_gen_count,
-            include_tools=None,  # Will use prompt_tool_rate internally via random
-        )
-        prompts = [{"prompt": p} for p in generated]
-        print(f"  Generated {len(prompts)} valid prompts")
-    else:
-        print("\nLoading prompts from file...")
-        prompts = load_prompts(config.data_path, config.max_samples)
+        dist.broadcast(prompt_count, src=0)
+        
+        if local_rank != 0:
+            # Load from temp file or original file
+            if config.generate_prompts:
+                import tempfile
+                # Find the prompt file from rank 0
+                prompt_file = os.path.join(tempfile.gettempdir(), f"task_prompts_{os.environ.get('MASTER_PID', os.getpid())}.json")
+                if os.path.exists(prompt_file):
+                    with open(prompt_file) as f:
+                        prompts = json.load(f)
+                else:
+                    # Fallback: generate our own (not ideal but works)
+                    print(f"  [Rank {local_rank}] Waiting for prompts...")
+                    import time
+                    time.sleep(5)
+                    prompts = load_prompts(config.data_path, config.max_samples) if not config.generate_prompts else []
+            else:
+                prompts = load_prompts(config.data_path, config.max_samples)
+        
+        dist.barrier()  # Ensure all ranks have prompts before continuing
     
     dataset = Dataset.from_list(prompts)
     
