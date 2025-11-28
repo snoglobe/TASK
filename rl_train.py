@@ -58,162 +58,694 @@ except ImportError:
 
 
 # =============================================================================
-# TASK Format Verifiers (Reward Functions)
+# TASK Format Parser and Verifier
 # =============================================================================
 
+class ParseError(Exception):
+    """Error during TASK format parsing."""
+    def __init__(self, message: str, position: int = -1):
+        self.message = message
+        self.position = position
+        super().__init__(f"{message} at position {position}" if position >= 0 else message)
+
+
+class TaskParser:
+    """
+    Recursive descent parser for TASK format.
+    
+    Grammar (simplified):
+        trace       := block*
+        block       := system_block | tool_block | user_block | plan_block | act_block | result_block | response_block
+        system_block:= 'system' string postfix*
+        user_block  := 'user' string postfix*
+        tool_block  := 'tool' object postfix*
+        plan_block  := 'plan' object postfix*
+        act_block   := 'act' object postfix*
+        result_block:= 'result' object postfix*
+        response_block := 'response' string postfix*
+        
+        object      := '{' (key '↦' value ('•' key '↦' value)*)? '}'
+        array       := '[' (value ('•' value)*)? ']'
+        value       := string | number | object | array | identifier
+        string      := '「' ... '」' | '"' ... '"' | unquoted_word
+        postfix     := tag | ref | satisfies | confidence
+        tag         := '🏷' identifier
+        ref         := '※' (identifier | array)
+        satisfies   := '⊨' number
+        confidence  := '𝑝' number
+    """
+    
+    def __init__(self, text: str):
+        self.text = text
+        self.pos = 0
+        self.length = len(text)
+        
+        # Collected data during parse
+        self.blocks = []  # List of (type, content, postfixes)
+        self.defined_tags = set()
+        self.referenced_tags = set()
+        self.defined_todos = set()
+        self.satisfied_todos = set()
+        
+        # Tool/call/result tracking
+        self.defined_tools = set()  # Tool names from tool { name ↦ ... } blocks
+        self.called_tools = set()   # Tool names from act { call ↦ { tool ↦ name } }
+        self.call_ids = set()       # IDs from act { call ↦ { id ↦ "xxx" } }
+        self.result_ids = set()     # IDs from result block data tags
+        
+        self.errors = []
+        self.warnings = []
+    
+    def parse(self) -> dict:
+        """Parse the trace and return analysis results."""
+        try:
+            self._parse_trace()
+        except ParseError as e:
+            self.errors.append(str(e))
+        
+        return {
+            'blocks': self.blocks,
+            'defined_tags': self.defined_tags,
+            'referenced_tags': self.referenced_tags,
+            'defined_todos': self.defined_todos,
+            'satisfied_todos': self.satisfied_todos,
+            'defined_tools': self.defined_tools,
+            'called_tools': self.called_tools,
+            'call_ids': self.call_ids,
+            'result_ids': self.result_ids,
+            'errors': self.errors,
+            'warnings': self.warnings,
+            'valid': len(self.errors) == 0,
+        }
+    
+    def _peek(self, n: int = 1) -> str:
+        """Peek at next n characters."""
+        return self.text[self.pos:self.pos + n]
+    
+    def _advance(self, n: int = 1) -> str:
+        """Advance and return consumed characters."""
+        result = self.text[self.pos:self.pos + n]
+        self.pos += n
+        return result
+    
+    def _skip_whitespace(self):
+        """Skip whitespace and newlines."""
+        while self.pos < self.length and self.text[self.pos] in ' \t\n\r':
+            self.pos += 1
+    
+    def _at_end(self) -> bool:
+        return self.pos >= self.length
+    
+    def _match(self, s: str) -> bool:
+        """Check if current position matches string."""
+        return self.text[self.pos:self.pos + len(s)] == s
+    
+    def _expect(self, s: str):
+        """Expect and consume a string."""
+        if not self._match(s):
+            raise ParseError(f"Expected '{s}'", self.pos)
+        self._advance(len(s))
+    
+    def _parse_trace(self):
+        """Parse top-level trace structure."""
+        while not self._at_end():
+            self._skip_whitespace()
+            if self._at_end():
+                break
+            
+            # Try to parse a block
+            block_type = self._try_parse_block_keyword()
+            if block_type:
+                self._parse_block(block_type)
+            else:
+                # Skip unknown content until next block or end
+                self._skip_to_next_block()
+    
+    def _try_parse_block_keyword(self) -> Optional[str]:
+        """Try to match a block keyword."""
+        keywords = ['system', 'tool', 'user', 'plan', 'act', 'result', 'response']
+        for kw in keywords:
+            if self._match(kw):
+                # Make sure it's not part of a longer word
+                end_pos = self.pos + len(kw)
+                if end_pos >= self.length or not self.text[end_pos].isalnum():
+                    self._advance(len(kw))
+                    return kw
+        return None
+    
+    def _skip_to_next_block(self):
+        """Skip content until we find a block keyword or end."""
+        keywords = ['system', 'tool', 'user', 'plan', 'act', 'result', 'response']
+        start = self.pos
+        while not self._at_end():
+            for kw in keywords:
+                if self._match(kw):
+                    end_pos = self.pos + len(kw)
+                    if end_pos >= self.length or not self.text[end_pos].isalnum():
+                        return
+            self._advance()
+        if self.pos > start:
+            self.warnings.append(f"Skipped unparseable content from {start} to {self.pos}")
+    
+    def _parse_block(self, block_type: str):
+        """Parse a specific block type."""
+        self._skip_whitespace()
+        
+        content = None
+        postfixes = []
+        
+        if block_type in ('system', 'user', 'response'):
+            # These expect a string
+            content = self._parse_string()
+            postfixes = self._parse_postfixes()
+        elif block_type in ('tool', 'plan', 'act', 'result'):
+            # These expect an object
+            content = self._parse_object()
+            postfixes = self._parse_postfixes()
+            
+            # Extract semantic info from content
+            if block_type == 'tool' and isinstance(content, dict):
+                self._extract_tool_info(content)
+            elif block_type == 'plan' and isinstance(content, dict):
+                self._extract_todos(content)
+            elif block_type == 'act' and isinstance(content, dict):
+                self._extract_act_info(content, postfixes)
+            elif block_type == 'result' and isinstance(content, dict):
+                self._extract_result_info(content, postfixes)
+        
+        self.blocks.append((block_type, content, postfixes))
+    
+    def _parse_string(self) -> str:
+        """Parse a string value (「」, "", or unquoted)."""
+        self._skip_whitespace()
+        
+        if self._match('「'):
+            return self._parse_cjk_string()
+        elif self._match('"'):
+            return self._parse_quoted_string()
+        else:
+            return self._parse_unquoted_word()
+    
+    def _parse_cjk_string(self) -> str:
+        """Parse 「...」 string."""
+        self._expect('「')
+        result = []
+        depth = 1
+        while not self._at_end() and depth > 0:
+            ch = self._peek()
+            if ch == '「':
+                depth += 1
+                result.append(self._advance())
+            elif ch == '」':
+                depth -= 1
+                if depth > 0:
+                    result.append(self._advance())
+                else:
+                    self._advance()
+            else:
+                result.append(self._advance())
+        return ''.join(result)
+    
+    def _parse_quoted_string(self) -> str:
+        """Parse "..." string."""
+        self._expect('"')
+        result = []
+        while not self._at_end():
+            ch = self._peek()
+            if ch == '"':
+                self._advance()
+                break
+            elif ch == '\\' and self.pos + 1 < self.length:
+                self._advance()  # Skip backslash
+                result.append(self._advance())  # Add escaped char
+            else:
+                result.append(self._advance())
+        return ''.join(result)
+    
+    def _parse_unquoted_word(self) -> str:
+        """Parse unquoted identifier/word."""
+        result = []
+        while not self._at_end():
+            ch = self._peek()
+            if ch in ' \t\n\r{}[]•↦🏷※⊨𝑝「」"':
+                break
+            result.append(self._advance())
+        return ''.join(result)
+    
+    def _parse_object(self) -> dict:
+        """Parse { key ↦ value • ... } object."""
+        self._skip_whitespace()
+        if not self._match('{'):
+            raise ParseError("Expected '{'", self.pos)
+        self._advance()
+        
+        result = {}
+        while True:
+            self._skip_whitespace()
+            if self._match('}'):
+                self._advance()
+                break
+            if self._at_end():
+                self.errors.append(f"Unclosed object at position {self.pos}")
+                break
+            
+            # Parse key
+            key = self._parse_key()
+            self._skip_whitespace()
+            
+            # Expect ↦
+            if self._match('↦'):
+                self._advance()
+            else:
+                self.errors.append(f"Expected '↦' after key '{key}' at position {self.pos}")
+                self._skip_to_separator()
+                continue
+            
+            self._skip_whitespace()
+            
+            # Parse value with postfixes
+            value = self._parse_value()
+            postfixes = self._parse_postfixes()
+            
+            result[key] = {'value': value, 'postfixes': postfixes}
+            
+            self._skip_whitespace()
+            
+            # Check for separator or end
+            if self._match('•'):
+                self._advance()
+            elif self._match('}'):
+                continue  # Will exit on next iteration
+            elif not self._at_end():
+                # Try to recover
+                self._skip_to_separator()
+        
+        return result
+    
+    def _parse_array(self) -> list:
+        """Parse [ a • b • c ] array."""
+        self._skip_whitespace()
+        self._expect('[')
+        
+        result = []
+        while True:
+            self._skip_whitespace()
+            if self._match(']'):
+                self._advance()
+                break
+            if self._at_end():
+                self.errors.append(f"Unclosed array at position {self.pos}")
+                break
+            
+            value = self._parse_value()
+            postfixes = self._parse_postfixes()
+            result.append({'value': value, 'postfixes': postfixes})
+            
+            self._skip_whitespace()
+            if self._match('•'):
+                self._advance()
+            elif self._match(']'):
+                continue
+        
+        return result
+    
+    def _parse_value(self):
+        """Parse any value type."""
+        self._skip_whitespace()
+        
+        if self._match('{'):
+            return self._parse_object()
+        elif self._match('['):
+            return self._parse_array()
+        elif self._match('「'):
+            return self._parse_cjk_string()
+        elif self._match('"'):
+            return self._parse_quoted_string()
+        else:
+            # Number or identifier
+            word = self._parse_unquoted_word()
+            # Try to parse as number
+            try:
+                if '.' in word:
+                    return float(word)
+                return int(word)
+            except ValueError:
+                return word
+    
+    def _parse_key(self) -> str:
+        """Parse object key (identifier or number)."""
+        self._skip_whitespace()
+        result = []
+        while not self._at_end():
+            ch = self._peek()
+            if ch in ' \t\n\r↦•{}[]':
+                break
+            result.append(self._advance())
+        return ''.join(result)
+    
+    def _parse_postfixes(self) -> list:
+        """Parse postfix operators (🏷, ※, ⊨, 𝑝)."""
+        postfixes = []
+        while True:
+            self._skip_whitespace()
+            
+            if self._match('🏷'):
+                self._advance()
+                self._skip_whitespace()
+                tag = self._parse_tag_name()
+                postfixes.append(('tag', tag))
+                self.defined_tags.add(tag)
+                
+            elif self._match('※'):
+                self._advance()
+                self._skip_whitespace()
+                if self._match('['):
+                    refs = self._parse_ref_array()
+                    postfixes.append(('ref', refs))
+                    for r in refs:
+                        self.referenced_tags.add(r)
+                else:
+                    ref = self._parse_tag_name()
+                    postfixes.append(('ref', [ref]))
+                    self.referenced_tags.add(ref)
+                    
+            elif self._match('⊨'):
+                self._advance()
+                self._skip_whitespace()
+                num = self._parse_number()
+                postfixes.append(('satisfies', num))
+                self.satisfied_todos.add(num)
+                
+            elif self._match('𝑝'):
+                self._advance()
+                self._skip_whitespace()
+                num = self._parse_float()
+                postfixes.append(('confidence', num))
+            else:
+                break
+        
+        return postfixes
+    
+    def _parse_tag_name(self) -> str:
+        """Parse a tag/ref name."""
+        # Handle quoted names
+        if self._match('"'):
+            return self._parse_quoted_string()
+        if self._match("'"):
+            self._advance()
+            result = []
+            while not self._at_end() and self._peek() != "'":
+                result.append(self._advance())
+            if self._match("'"):
+                self._advance()
+            return ''.join(result)
+        
+        # Unquoted name
+        result = []
+        while not self._at_end():
+            ch = self._peek()
+            if ch.isalnum() or ch in '_-':
+                result.append(self._advance())
+            else:
+                break
+        return ''.join(result)
+    
+    def _parse_ref_array(self) -> list:
+        """Parse [ref1 • ref2 • ...] reference array."""
+        self._expect('[')
+        refs = []
+        while True:
+            self._skip_whitespace()
+            if self._match(']'):
+                self._advance()
+                break
+            if self._at_end():
+                break
+            
+            ref = self._parse_tag_name()
+            if ref:
+                refs.append(ref)
+            
+            self._skip_whitespace()
+            if self._match('•'):
+                self._advance()
+        
+        return refs
+    
+    def _parse_number(self) -> int:
+        """Parse integer."""
+        result = []
+        while not self._at_end() and self._peek().isdigit():
+            result.append(self._advance())
+        return int(''.join(result)) if result else 0
+    
+    def _parse_float(self) -> float:
+        """Parse float."""
+        result = []
+        while not self._at_end() and (self._peek().isdigit() or self._peek() == '.'):
+            result.append(self._advance())
+        try:
+            return float(''.join(result))
+        except ValueError:
+            return 0.0
+    
+    def _skip_to_separator(self):
+        """Skip to next • or }."""
+        while not self._at_end():
+            if self._match('•') or self._match('}') or self._match(']'):
+                return
+            self._advance()
+    
+    def _extract_tool_info(self, tool_obj: dict):
+        """Extract tool name from tool definition block."""
+        if 'name' in tool_obj:
+            name_val = tool_obj['name'].get('value', '')
+            if isinstance(name_val, str) and name_val:
+                self.defined_tools.add(name_val)
+    
+    def _extract_todos(self, plan_obj: dict):
+        """Extract todo definitions from plan object."""
+        if 'todo' in plan_obj:
+            todo_val = plan_obj['todo'].get('value', {})
+            if isinstance(todo_val, dict):
+                for key in todo_val:
+                    try:
+                        self.defined_todos.add(int(key))
+                    except ValueError:
+                        pass
+    
+    def _extract_act_info(self, act_obj: dict, postfixes: list):
+        """Extract info from act block."""
+        # Postfixes on the act block itself can satisfy todos
+        for op, val in postfixes:
+            if op == 'satisfies':
+                self.satisfied_todos.add(val)
+        
+        # Check for satisfies in nested content
+        for key, val_obj in act_obj.items():
+            if isinstance(val_obj, dict) and 'postfixes' in val_obj:
+                for op, val in val_obj['postfixes']:
+                    if op == 'satisfies':
+                        self.satisfied_todos.add(val)
+        
+        # Extract tool calls: act { call ↦ { tool ↦ name • id ↦ "xxx" } }
+        if 'call' in act_obj:
+            call_val = act_obj['call'].get('value', {})
+            if isinstance(call_val, dict):
+                # Get tool name
+                if 'tool' in call_val:
+                    tool_name = call_val['tool'].get('value', '')
+                    if isinstance(tool_name, str) and tool_name:
+                        self.called_tools.add(tool_name)
+                
+                # Get call ID
+                if 'id' in call_val:
+                    call_id = call_val['id'].get('value', '')
+                    if isinstance(call_id, str) and call_id:
+                        self.call_ids.add(call_id)
+    
+    def _extract_result_info(self, result_obj: dict, postfixes: list):
+        """Extract info from result block."""
+        # Check for tag on data value and collect result IDs
+        if 'data' in result_obj:
+            data_obj = result_obj['data']
+            if isinstance(data_obj, dict) and 'postfixes' in data_obj:
+                has_tag = False
+                for op, val in data_obj['postfixes']:
+                    if op == 'tag':
+                        has_tag = True
+                        self.result_ids.add(val)
+                if not has_tag:
+                    self.warnings.append("Result data value should have a 🏷 tag")
+        
+        # Also check for tag on the result block itself (less preferred but valid)
+        for op, val in postfixes:
+            if op == 'tag':
+                self.result_ids.add(val)
+
+
 class TaskVerifier:
-    """Deterministic verifier for TASK format traces."""
+    """Deterministic verifier for TASK format traces using actual parsing."""
     
     def __init__(self):
-        # Patterns
-        self.todo_def_pattern = re.compile(r'(\d+)\s*↦\s*[「"]')
-        self.satisfies_pattern = re.compile(r'⊨\s*(\d+)')
-        self.tag_def_pattern = re.compile(r'🏷\s*["\']?([a-zA-Z_][a-zA-Z0-9_-]*)["\']?')
-        self.ref_pattern = re.compile(r'※\s*["\']?([a-zA-Z_][a-zA-Z0-9_-]*)["\']?')
-        self.ref_array_pattern = re.compile(r'※\s*\[([^\]]+)\]')
+        pass
     
-    def check_brackets_balanced(self, trace: str) -> tuple[bool, str]:
-        """Check if all brackets are balanced."""
-        counts = {
-            '{': 0, '}': 0,
-            '[': 0, ']': 0,
-            '「': 0, '」': 0,
-        }
-        for char in trace:
-            if char in counts:
-                counts[char] += 1
-        
-        if counts['{'] != counts['}']:
-            return False, f"Brace mismatch: {counts['{']} open, {counts['}']} close"
-        if counts['['] != counts[']']:
-            return False, f"Bracket mismatch: {counts['[']} open, {counts[']']} close"
-        if counts['「'] != counts['」']:
-            return False, f"CJK bracket mismatch: {counts['「']} open, {counts['」']} close"
-        return True, "Brackets balanced"
-    
-    def check_todos_satisfied(self, trace: str) -> tuple[bool, str, set, set]:
-        """Check if all todos are satisfied."""
-        # Find todo definitions in plan block
-        plan_match = re.search(r'plan\s*\{.*?todo\s*↦\s*\{([^}]*)\}', trace, re.DOTALL)
-        defined_todos = set()
-        if plan_match:
-            todo_block = plan_match.group(1)
-            for match in self.todo_def_pattern.finditer(todo_block):
-                defined_todos.add(int(match.group(1)))
-        
-        # Find satisfied todos
-        satisfied_todos = set()
-        for match in self.satisfies_pattern.finditer(trace):
-            satisfied_todos.add(int(match.group(1)))
-        
-        unsatisfied = defined_todos - satisfied_todos
-        if unsatisfied:
-            return False, f"Unsatisfied todos: {unsatisfied}", defined_todos, satisfied_todos
-        return True, "All todos satisfied", defined_todos, satisfied_todos
-    
-    def check_todos_start_at_one(self, trace: str) -> tuple[bool, str]:
-        """Check if todos start at 1."""
-        plan_match = re.search(r'plan\s*\{.*?todo\s*↦\s*\{([^}]*)\}', trace, re.DOTALL)
-        if plan_match:
-            todo_block = plan_match.group(1)
-            todos = [int(m.group(1)) for m in self.todo_def_pattern.finditer(todo_block)]
-            if todos and min(todos) != 1:
-                return False, f"Todos start at {min(todos)}, not 1"
-        return True, "Todos start at 1"
-    
-    def check_refs_valid(self, trace: str) -> tuple[bool, str, set, set]:
-        """Check if all references point to defined tags."""
-        # Find all defined tags
-        defined_tags = set()
-        for match in self.tag_def_pattern.finditer(trace):
-            defined_tags.add(match.group(1))
-        
-        # Find all references
-        referenced_tags = set()
-        for match in self.ref_pattern.finditer(trace):
-            referenced_tags.add(match.group(1))
-        for match in self.ref_array_pattern.finditer(trace):
-            for item in match.group(1).split('•'):
-                item = item.strip().strip('"\'')
-                if item and re.match(r'[a-zA-Z_]', item):
-                    referenced_tags.add(item)
-        
-        # Check for orphan references
-        orphans = referenced_tags - defined_tags
-        # Filter out usr1, sys1 etc which are typically defined at the start
-        orphans = {t for t in orphans if not re.match(r'^(usr|sys)\d+$', t)}
-        
-        if orphans:
-            return False, f"Orphan references: {orphans}", defined_tags, referenced_tags
-        return True, "All references valid", defined_tags, referenced_tags
-    
-    def check_has_response(self, trace: str) -> tuple[bool, str]:
-        """Check if trace ends with a response block."""
-        if 'response「' in trace or 'response 「' in trace:
-            return True, "Has response"
-        return False, "Missing response block"
-    
-    def check_has_plan(self, trace: str) -> tuple[bool, str]:
-        """Check if trace has a plan block."""
-        if 'plan {' in trace or 'plan{' in trace:
-            return True, "Has plan"
-        return False, "Missing plan block"
-    
-    def check_structure_order(self, trace: str) -> tuple[bool, str]:
-        """Check if structure follows correct order: plan → act → response."""
-        plan_pos = trace.find('plan {')
-        if plan_pos == -1:
-            plan_pos = trace.find('plan{')
-        
-        response_pos = trace.find('response「')
-        if response_pos == -1:
-            response_pos = trace.find('response 「')
-        
-        if plan_pos != -1 and response_pos != -1:
-            if plan_pos > response_pos:
-                return False, "Plan comes after response"
-        return True, "Structure order correct"
+    def parse(self, trace: str) -> dict:
+        """Parse trace and return analysis."""
+        parser = TaskParser(trace)
+        return parser.parse()
     
     def compute_reward(self, trace: str) -> tuple[float, dict]:
-        """Compute total reward and breakdown."""
+        """Compute total reward and breakdown based on parsing."""
+        result = self.parse(trace)
         rewards = {}
         total = 0.0
         
-        # Hard constraints (must pass or big penalty)
-        balanced, msg = self.check_brackets_balanced(trace)
-        rewards['brackets_balanced'] = 1.0 if balanced else -2.0
-        total += rewards['brackets_balanced']
+        # Parse success (fundamental)
+        parse_valid = result['valid']
+        rewards['parse_valid'] = 1.0 if parse_valid else -3.0
+        total += rewards['parse_valid']
         
-        has_response, msg = self.check_has_response(trace)
-        rewards['has_response'] = 0.5 if has_response else -1.5
-        total += rewards['has_response']
+        # Block structure
+        block_types = [b[0] for b in result['blocks']]
         
-        has_plan, msg = self.check_has_plan(trace)
+        has_plan = 'plan' in block_types
         rewards['has_plan'] = 0.3 if has_plan else -0.5
         total += rewards['has_plan']
         
-        # Soft constraints
-        todos_satisfied, msg, defined, satisfied = self.check_todos_satisfied(trace)
-        if defined:
-            ratio = len(satisfied) / len(defined) if defined else 0
-            rewards['todos_satisfied'] = ratio * 0.5
+        has_response = 'response' in block_types
+        rewards['has_response'] = 0.5 if has_response else -1.5
+        total += rewards['has_response']
+        
+        # Structure order: plan should come before response
+        if has_plan and has_response:
+            plan_idx = block_types.index('plan')
+            response_idx = block_types.index('response')
+            order_ok = plan_idx < response_idx
+            rewards['structure_order'] = 0.2 if order_ok else -0.3
         else:
-            rewards['todos_satisfied'] = 0.0
-        total += rewards['todos_satisfied']
-        
-        todos_start_one, msg = self.check_todos_start_at_one(trace)
-        rewards['todos_start_at_1'] = 0.3 if todos_start_one else -0.5
-        total += rewards['todos_start_at_1']
-        
-        refs_valid, msg, defined_tags, referenced_tags = self.check_refs_valid(trace)
-        rewards['refs_valid'] = 0.3 if refs_valid else -0.3
-        total += rewards['refs_valid']
-        
-        structure_ok, msg = self.check_structure_order(trace)
-        rewards['structure_order'] = 0.1 if structure_ok else -0.2
+            rewards['structure_order'] = 0.0
         total += rewards['structure_order']
         
+        # Todo satisfaction
+        defined_todos = result['defined_todos']
+        satisfied_todos = result['satisfied_todos']
+        
+        if defined_todos:
+            # Check todos start at 1
+            if min(defined_todos) == 1:
+                rewards['todos_start_at_1'] = 0.3
+            else:
+                rewards['todos_start_at_1'] = -0.5
+            total += rewards['todos_start_at_1']
+            
+            # Check all todos satisfied
+            unsatisfied = defined_todos - satisfied_todos
+            if not unsatisfied:
+                rewards['todos_satisfied'] = 0.5
+            else:
+                ratio = len(satisfied_todos) / len(defined_todos)
+                rewards['todos_satisfied'] = (ratio * 0.5) - 0.3  # Partial credit minus penalty
+            total += rewards['todos_satisfied']
+        else:
+            rewards['todos_start_at_1'] = 0.0
+            rewards['todos_satisfied'] = 0.0
+        
+        # Tag/reference validity
+        defined_tags = result['defined_tags']
+        referenced_tags = result['referenced_tags']
+        
+        # Filter standard tags (usr1, sys1, etc.) from orphan check
+        filtered_refs = {t for t in referenced_tags if not re.match(r'^(usr|sys)\d+$', t)}
+        orphan_refs = filtered_refs - defined_tags
+        
+        if not orphan_refs:
+            rewards['refs_valid'] = 0.3
+        else:
+            # Penalty proportional to number of orphans
+            penalty = min(len(orphan_refs) * 0.1, 0.5)
+            rewards['refs_valid'] = -penalty
+        total += rewards['refs_valid']
+        
+        # Tool call validity - check for hallucinated tools
+        defined_tools = result['defined_tools']
+        called_tools = result['called_tools']
+        
+        if called_tools:
+            if defined_tools:
+                # Check if all called tools are defined
+                hallucinated_tools = called_tools - defined_tools
+                if not hallucinated_tools:
+                    rewards['tools_valid'] = 0.5  # Good reward for not hallucinating
+                else:
+                    # Heavy penalty for hallucinating tools
+                    penalty = min(len(hallucinated_tools) * 0.5, 1.5)
+                    rewards['tools_valid'] = -penalty
+            else:
+                # Called tools but none defined - all are hallucinated
+                rewards['tools_valid'] = -1.5
+        else:
+            # No tool calls - neutral (tools might not be needed)
+            rewards['tools_valid'] = 0.0
+        total += rewards['tools_valid']
+        
+        # Result/call ID matching - ensure results correspond to calls
+        call_ids = result['call_ids']
+        result_ids = result['result_ids']
+        
+        if call_ids or result_ids:
+            # Check for orphan results (results without matching calls)
+            orphan_results = result_ids - call_ids
+            # Check for missing results (calls without matching results)
+            missing_results = call_ids - result_ids
+            
+            if not orphan_results and not missing_results:
+                rewards['call_result_match'] = 0.4
+            else:
+                penalty = 0.0
+                if orphan_results:
+                    # Hallucinated results
+                    penalty += min(len(orphan_results) * 0.3, 0.6)
+                if missing_results:
+                    # Missing results for calls (less severe - might be intentional)
+                    penalty += min(len(missing_results) * 0.1, 0.3)
+                rewards['call_result_match'] = -penalty
+        else:
+            rewards['call_result_match'] = 0.0
+        total += rewards['call_result_match']
+        
+        # Warnings penalty (minor issues)
+        warning_count = len(result['warnings'])
+        rewards['warnings'] = -min(warning_count * 0.05, 0.3)
+        total += rewards['warnings']
+        
+        # Error count penalty (beyond parse failure)
+        error_count = len(result['errors'])
+        if error_count > 0 and parse_valid:  # Additional errors beyond parse failure
+            rewards['additional_errors'] = -min(error_count * 0.2, 0.5)
+            total += rewards['additional_errors']
+        
         return total, rewards
+    
+    def detailed_check(self, trace: str) -> dict:
+        """Return detailed parsing results for debugging."""
+        result = self.parse(trace)
+        score, rewards = self.compute_reward(trace)
+        return {
+            'score': score,
+            'rewards': rewards,
+            'blocks': [(b[0], len(str(b[1]))) for b in result['blocks']],
+            'defined_tags': list(result['defined_tags']),
+            'referenced_tags': list(result['referenced_tags']),
+            'defined_todos': list(result['defined_todos']),
+            'satisfied_todos': list(result['satisfied_todos']),
+            'defined_tools': list(result['defined_tools']),
+            'called_tools': list(result['called_tools']),
+            'call_ids': list(result['call_ids']),
+            'result_ids': list(result['result_ids']),
+            'errors': result['errors'],
+            'warnings': result['warnings'],
+        }
 
 
 # =============================================================================
@@ -292,14 +824,25 @@ class LLMJudge:
                 tensor_parallel_size=tensor_parallel_size,
                 gpu_memory_utilization=gpu_memory_utilization,
                 dtype=dtype,
-                trust_remote_code=True,
+                trust_remote_code=False,
                 max_model_len=8192,  # Limit context for judge efficiency
             )
-            self._sampling_params = SamplingParams(
-                temperature=0.0,
-                max_tokens=256,
-            )
-            print(f"[Judge] Model loaded successfully")
+            # Use guided JSON generation to enforce schema
+            # vLLM uses guided_json parameter (dict or JSON string)
+            try:
+                self._sampling_params = SamplingParams(
+                    temperature=0.0,
+                    max_tokens=256,
+                    guided_json=JUDGE_JSON_SCHEMA,
+                )
+                print(f"[Judge] Model loaded with guided JSON output")
+            except TypeError:
+                # Fallback for older vLLM versions without guided generation
+                self._sampling_params = SamplingParams(
+                    temperature=0.0,
+                    max_tokens=256,
+                )
+                print(f"[Judge] Model loaded (no guided generation - older vLLM)")
         else:
             raise ValueError(f"Unknown backend: {backend}. Use 'vllm' or 'openai'")
     
@@ -530,6 +1073,364 @@ class LLMJudge:
 
 
 # =============================================================================
+# On-the-fly Prompt Generator
+# =============================================================================
+
+# JSON Schema for judge output (used with vLLM guided generation)
+JUDGE_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "coherence": {"type": "integer", "minimum": 0, "maximum": 10},
+        "relevance": {"type": "integer", "minimum": 0, "maximum": 10},
+        "reasoning": {"type": "integer", "minimum": 0, "maximum": 10},
+        "completion": {"type": "integer", "minimum": 0, "maximum": 10},
+        "quality": {"type": "integer", "minimum": 0, "maximum": 10},
+        "explanation": {"type": "string"}
+    },
+    "required": ["coherence", "relevance", "reasoning", "completion", "quality"]
+}
+
+# JSON Schema for prompt generator output
+PROMPT_GEN_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "system_prompt": {"type": "string", "minLength": 10, "maxLength": 500},
+        "tools": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "pattern": "^[a-z_][a-z0-9_]*$"},
+                    "description": {"type": "string"},
+                    "params": {
+                        "type": "object",
+                        "additionalProperties": {
+                            "type": "string",
+                            "enum": ["string", "number", "integer", "boolean", "array", "object"]
+                        }
+                    }
+                },
+                "required": ["name", "description", "params"]
+            },
+            "maxItems": 3
+        },
+        "user_request": {"type": "string", "minLength": 10},
+        "domain": {"type": "string", "enum": ["coding", "research", "writing", "math", "planning", "general", "data_analysis"]},
+        "complexity": {"type": "string", "enum": ["simple", "medium", "complex"]}
+    },
+    "required": ["system_prompt", "tools", "user_request", "domain", "complexity"]
+}
+
+PROMPT_GEN_SYSTEM = """You generate training scenarios for an AI assistant that uses a structured reasoning format.
+
+Generate a scenario with:
+1. A system prompt describing the assistant's role
+2. Optionally 0-3 tools the assistant can use
+3. A user request
+
+## CRITICAL: Tool Guidelines
+
+Tools must be DETERMINISTIC, VERIFIABLE operations - NOT hidden LLM calls.
+
+✅ ALLOWED tools (real operations):
+- File ops: read_file, write_file, list_dir, delete_file
+- Code: run_code, run_tests, execute_shell, compile
+- Data: query_database, execute_sql, fetch_url, call_api
+- Search: search_web, search_codebase, grep
+- System: get_time, get_weather, get_env_var
+- Explicit LLM: call_llm (when you explicitly need another LLM)
+
+❌ FORBIDDEN tools (hidden LLM magic):
+- critique_writing, analyze_sentiment, summarize_text
+- improve_code, refactor_function, fix_bugs  
+- generate_ideas, brainstorm, suggest_alternatives
+- explain_concept, translate_text, paraphrase
+- review_code, assess_quality, evaluate_answer
+
+If the task needs reasoning/analysis, the model should use its own thinking, NOT call a tool.
+If you genuinely need an external LLM call, use `call_llm` explicitly.
+
+## Parameter Types (MUST be valid JSON Schema types):
+- string: text values
+- number: floating point numbers
+- integer: whole numbers
+- boolean: true/false
+- array: lists of values
+- object: nested objects
+
+## Output Format (JSON)
+
+{
+  "system_prompt": "You are a helpful assistant that...",
+  "tools": [
+    {
+      "name": "tool_name_snake_case",
+      "description": "What it does",
+      "params": {"param1": "string", "param2": "integer", "param3": "boolean"}
+    }
+  ],
+  "user_request": "The user's task or question",
+  "domain": "coding|research|writing|math|planning|general|data_analysis",
+  "complexity": "simple|medium|complex"
+}
+
+Generate diverse, realistic scenarios. Vary domains, complexity, and whether tools are needed."""
+
+PROMPT_GEN_USER = """Generate a training scenario.
+
+Requirements:
+- Domain hint: {domain}
+- Include tools: {include_tools}
+- Complexity: {complexity}
+
+JSON only:"""
+
+
+class PromptGenerator:
+    """Generates training prompts on-the-fly using an LLM.
+    
+    Can share the same vLLM instance as the judge for efficiency.
+    """
+    
+    DOMAINS = ['coding', 'research', 'writing', 'math', 'planning', 'general', 'data_analysis']
+    COMPLEXITIES = ['simple', 'medium', 'complex']
+    
+    def __init__(
+        self,
+        llm_instance=None,  # Can share vLLM instance with judge
+        model: str = "Qwen/Qwen2.5-72B-Instruct",
+        backend: str = "vllm",
+        api_key: Optional[str] = None,
+        tensor_parallel_size: int = 6,
+        dtype: str = "bfloat16",
+    ):
+        self.backend = backend
+        self.model = model
+        
+        if llm_instance is not None:
+            # Share existing vLLM instance
+            self._llm = llm_instance
+            self._owns_llm = False
+        elif backend == "vllm":
+            if not VLLM_AVAILABLE:
+                raise ImportError("vllm required for prompt generation")
+            print(f"[PromptGen] Loading {model}...")
+            self._llm = LLM(
+                model=model,
+                tensor_parallel_size=tensor_parallel_size,
+                gpu_memory_utilization=0.9,
+                dtype=dtype,
+                trust_remote_code=False,
+                max_model_len=4096,
+            )
+            self._owns_llm = True
+        elif backend == "openai":
+            if not OPENAI_AVAILABLE:
+                raise ImportError("openai required")
+            self.client = OpenAI(api_key=api_key) if api_key else OpenAI()
+            self._llm = None
+            self._owns_llm = False
+        
+        # Use guided JSON generation to enforce schema
+        # This ensures tool param types are valid JSON Schema types
+        if VLLM_AVAILABLE:
+            try:
+                self._sampling_params = SamplingParams(
+                    temperature=0.9,  # Higher temp for diversity
+                    max_tokens=512,
+                    guided_json=PROMPT_GEN_JSON_SCHEMA,
+                )
+            except TypeError:
+                # Fallback for older vLLM versions
+                self._sampling_params = SamplingParams(
+                    temperature=0.9,
+                    max_tokens=512,
+                )
+        else:
+            self._sampling_params = None
+        
+        # Stats
+        self.generated = 0
+    
+    def _parse_scenario(self, text: str) -> Optional[dict]:
+        """Parse JSON scenario from LLM output.
+        
+        With guided JSON generation, output should always be valid JSON.
+        Fallbacks are for non-vLLM backends or edge cases.
+        """
+        # With guided generation, this should always work
+        try:
+            scenario = json.loads(text)
+            # Validate tool param types are correct
+            if 'tools' in scenario:
+                valid_types = {'string', 'number', 'integer', 'boolean', 'array', 'object'}
+                for tool in scenario['tools']:
+                    if 'params' in tool:
+                        for param_name, param_type in tool['params'].items():
+                            if param_type not in valid_types:
+                                # Fix invalid type to string
+                                tool['params'][param_name] = 'string'
+            return scenario
+        except json.JSONDecodeError:
+            pass
+        
+        # Fallback for non-guided backends: try extracting from code block
+        match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except:
+                pass
+        
+        return None
+    
+    def _format_tools_task(self, tools: list[dict]) -> str:
+        """Format tools into TASK format with proper JSON Schema types."""
+        if not tools:
+            return ""
+        
+        # Valid JSON Schema types
+        VALID_TYPES = {'string', 'number', 'integer', 'boolean', 'array', 'object'}
+        
+        result = []
+        for tool in tools:
+            name = tool.get('name', 'unknown')
+            desc = tool.get('description', '')
+            params = tool.get('params', {})
+            
+            params_str = ""
+            if params:
+                param_items = []
+                for pname, ptype in params.items():
+                    # Ensure type is valid JSON Schema type
+                    if ptype not in VALID_TYPES:
+                        ptype = 'string'  # Default to string for invalid types
+                    param_items.append(f"{pname} ↦ {{ type ↦ {ptype} }}")
+                params_str = f" • params ↦ {{ {' • '.join(param_items)} }}"
+            
+            tool_str = f'tool {{ name ↦ {name} • description ↦ "{desc}"{params_str} }}'
+            result.append(tool_str)
+        
+        return '\n'.join(result)
+    
+    def _format_prompt(self, scenario: dict) -> str:
+        """Convert scenario to TASK-format prompt."""
+        system = scenario.get('system_prompt', 'You are a helpful assistant.')
+        user = scenario.get('user_request', 'Help me.')
+        tools = scenario.get('tools', [])
+        
+        parts = [
+            f'<|im_start|>system',
+            f'system「{system}」🏷 sys1',
+        ]
+        
+        if tools:
+            parts.append(self._format_tools_task(tools))
+        
+        parts.extend([
+            '<|im_end|>',
+            '',
+            '<|im_start|>user',
+            f'user「{user}」🏷 usr1',
+            '<|im_end|>',
+            '',
+            '<|im_start|>assistant',
+        ])
+        
+        return '\n'.join(parts)
+    
+    def generate_one(
+        self,
+        domain: Optional[str] = None,
+        include_tools: Optional[bool] = None,
+        complexity: Optional[str] = None,
+    ) -> Optional[str]:
+        """Generate a single prompt."""
+        # Randomize if not specified
+        domain = domain or random.choice(self.DOMAINS)
+        include_tools = include_tools if include_tools is not None else random.random() < 0.6
+        complexity = complexity or random.choice(self.COMPLEXITIES)
+        
+        user_msg = PROMPT_GEN_USER.format(
+            domain=domain,
+            include_tools="yes (1-3 tools)" if include_tools else "no",
+            complexity=complexity,
+        )
+        
+        if self.backend == "vllm" and self._llm:
+            prompt = f"""<|im_start|>system
+{PROMPT_GEN_SYSTEM}<|im_end|>
+<|im_start|>user
+{user_msg}<|im_end|>
+<|im_start|>assistant
+"""
+            outputs = self._llm.generate([prompt], self._sampling_params)
+            response_text = outputs[0].outputs[0].text
+        else:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": PROMPT_GEN_SYSTEM},
+                    {"role": "user", "content": user_msg}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.9,
+                max_tokens=512,
+            )
+            response_text = response.choices[0].message.content
+        
+        scenario = self._parse_scenario(response_text)
+        if scenario:
+            self.generated += 1
+            return self._format_prompt(scenario)
+        return None
+    
+    def generate_batch(self, n: int, **kwargs) -> list[str]:
+        """Generate multiple prompts."""
+        if self.backend == "vllm" and self._llm:
+            # Batch generation for efficiency
+            prompts_to_gen = []
+            for _ in range(n):
+                domain = kwargs.get('domain') or random.choice(self.DOMAINS)
+                include_tools = kwargs.get('include_tools')
+                if include_tools is None:
+                    include_tools = random.random() < 0.6
+                complexity = kwargs.get('complexity') or random.choice(self.COMPLEXITIES)
+                
+                user_msg = PROMPT_GEN_USER.format(
+                    domain=domain,
+                    include_tools="yes (1-3 tools)" if include_tools else "no",
+                    complexity=complexity,
+                )
+                
+                prompt = f"""<|im_start|>system
+{PROMPT_GEN_SYSTEM}<|im_end|>
+<|im_start|>user
+{user_msg}<|im_end|>
+<|im_start|>assistant
+"""
+                prompts_to_gen.append(prompt)
+            
+            outputs = self._llm.generate(prompts_to_gen, self._sampling_params)
+            
+            results = []
+            for output in outputs:
+                response_text = output.outputs[0].text
+                scenario = self._parse_scenario(response_text)
+                if scenario:
+                    self.generated += 1
+                    results.append(self._format_prompt(scenario))
+            
+            return results
+        else:
+            # Sequential for OpenAI
+            return [p for p in (self.generate_one(**kwargs) for _ in range(n)) if p]
+    
+    def stats(self) -> dict:
+        return {'generated': self.generated}
+
+
+# =============================================================================
 # Hybrid Reward Function
 # =============================================================================
 
@@ -672,6 +1573,11 @@ class RLConfig:
     judge_dtype: str = "bfloat16"  # "bfloat16", "float16", "auto"
     openai_api_key: Optional[str] = None
     
+    # Dynamic prompt generation
+    generate_prompts: bool = False  # Generate prompts on-the-fly instead of using data file
+    prompt_gen_count: int = 1000  # Number of prompts to generate (if generate_prompts=True)
+    prompt_tool_rate: float = 0.6  # Fraction of generated prompts that include tools
+    
     max_samples: int = None  # Limit training samples
 
 
@@ -717,6 +1623,14 @@ def main():
     parser.add_argument("--openai-api-key", type=str, default=None,
                         help="OpenAI API key (for openai backend)")
     
+    # Dynamic prompt generation
+    parser.add_argument("--generate-prompts", action="store_true",
+                        help="Generate prompts on-the-fly instead of using data file")
+    parser.add_argument("--prompt-gen-count", type=int, default=1000,
+                        help="Number of prompts to generate (when --generate-prompts)")
+    parser.add_argument("--prompt-tool-rate", type=float, default=0.6,
+                        help="Fraction of generated prompts that include tools (0-1)")
+    
     args = parser.parse_args()
     
     config = RLConfig(
@@ -736,23 +1650,31 @@ def main():
         judge_gpus=args.judge_gpus,
         judge_dtype=args.judge_dtype,
         openai_api_key=args.openai_api_key,
+        generate_prompts=args.generate_prompts,
+        prompt_gen_count=args.prompt_gen_count,
+        prompt_tool_rate=args.prompt_tool_rate,
     )
     
     print("="*60)
     print("GRPO Training for TASK Format")
     print("="*60)
     print(f"Model: {config.model_path}")
-    print(f"Data: {config.data_path}")
+    if config.generate_prompts:
+        print(f"Prompts: GENERATING {config.prompt_gen_count} on-the-fly")
+        print(f"  Tool rate: {config.prompt_tool_rate*100:.0f}%")
+    else:
+        print(f"Data: {config.data_path}")
     print(f"Output: {config.output_dir}")
     print(f"Learning rate: {config.learning_rate}")
     print(f"Num generations per prompt: {config.num_generations}")
     print("-"*60)
-    if config.judge_rate > 0:
-        print(f"LLM Judge: ENABLED")
+    if config.judge_rate > 0 or config.generate_prompts:
+        print(f"LLM (Judge/Generator): ENABLED")
         print(f"  Backend: {config.judge_backend}")
         print(f"  Model: {config.judge_model}")
-        print(f"  Rate: {config.judge_rate*100:.0f}% of samples")
-        print(f"  Weight: {config.judge_weight}")
+        if config.judge_rate > 0:
+            print(f"  Judge rate: {config.judge_rate*100:.0f}% of samples")
+            print(f"  Judge weight: {config.judge_weight}")
         if config.judge_backend == "vllm":
             print(f"  GPUs: {config.judge_gpus}")
             print(f"  Dtype: {config.judge_dtype}")
@@ -774,10 +1696,10 @@ def main():
     
     # Load model and tokenizer
     print("\nLoading model...")
-    tokenizer = AutoTokenizer.from_pretrained(config.model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(config.model_path, trust_remote_code=False)
     model = AutoModelForCausalLM.from_pretrained(
         config.model_path,
-        trust_remote_code=True,
+        trust_remote_code=False,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     )
@@ -785,9 +1707,37 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Load prompts
-    print("\nLoading prompts...")
-    prompts = load_prompts(config.data_path, config.max_samples)
+    # Load or generate prompts
+    prompt_generator = None
+    if config.generate_prompts:
+        print("\nGenerating prompts on-the-fly...")
+        # Create prompt generator (can share LLM with judge if both use vllm)
+        llm_instance = None
+        if _reward_fn and _reward_fn.judge and hasattr(_reward_fn.judge, '_llm'):
+            llm_instance = _reward_fn.judge._llm
+            print("  (sharing LLM instance with judge)")
+        
+        prompt_generator = PromptGenerator(
+            llm_instance=llm_instance,
+            model=config.judge_model,
+            backend=config.judge_backend,
+            api_key=config.openai_api_key,
+            tensor_parallel_size=config.judge_gpus,
+            dtype=config.judge_dtype,
+        )
+        
+        # Generate prompts
+        print(f"  Generating {config.prompt_gen_count} prompts...")
+        generated = prompt_generator.generate_batch(
+            config.prompt_gen_count,
+            include_tools=None,  # Will use prompt_tool_rate internally via random
+        )
+        prompts = [{"prompt": p} for p in generated]
+        print(f"  Generated {len(prompts)} valid prompts")
+    else:
+        print("\nLoading prompts from file...")
+        prompts = load_prompts(config.data_path, config.max_samples)
+    
     dataset = Dataset.from_list(prompts)
     
     # GRPO config
@@ -820,16 +1770,21 @@ def main():
     try:
         trainer.train()
     finally:
-        # Print judge stats if used
+        # Print stats
+        print("\n" + "="*60)
+        print("Training Statistics")
+        print("="*60)
+        
+        if prompt_generator:
+            gen_stats = prompt_generator.stats()
+            print(f"Prompts generated: {gen_stats.get('generated', 0)}")
+        
         if _reward_fn:
             stats = _reward_fn.get_stats()
             if stats.get('judge_enabled'):
-                print("\n" + "="*60)
-                print("LLM Judge Statistics")
-                print("="*60)
-                print(f"Total API calls: {stats.get('calls', 0)}")
-                print(f"Cache hits: {stats.get('cache_hits', 0)}")
-                print(f"Cache rate: {stats.get('cache_rate', 0)*100:.1f}%")
+                print(f"Judge API calls: {stats.get('calls', 0)}")
+                print(f"Judge cache hits: {stats.get('cache_hits', 0)}")
+                print(f"Judge cache rate: {stats.get('cache_rate', 0)*100:.1f}%")
     
     # Save
     print(f"\nSaving model to {config.output_dir}/final...")

@@ -17,67 +17,125 @@ Usage:
     
     # Interactive mode
     python eval_rewards.py --interactive
+    
+    # Detailed parse output
+    python eval_rewards.py --file output.txt --verbose
 """
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
 # Import from rl_train
-from rl_train import TaskVerifier, LLMJudge, OPENAI_AVAILABLE
+from rl_train import TaskVerifier, TaskParser, LLMJudge, OPENAI_AVAILABLE
 
 
-def print_verifier_results(trace: str):
-    """Print detailed verifier results."""
+def print_verifier_results(trace: str, verbose: bool = False):
+    """Print detailed verifier results using the parser."""
     verifier = TaskVerifier()
     
     print("\n" + "="*60)
-    print("DETERMINISTIC VERIFIER RESULTS")
+    print("TASK FORMAT PARSER RESULTS")
     print("="*60)
     
-    # Individual checks
-    checks = [
-        ("Brackets Balanced", verifier.check_brackets_balanced(trace)),
-        ("Has Response", verifier.check_has_response(trace)),
-        ("Has Plan", verifier.check_has_plan(trace)),
-        ("Todos Start at 1", verifier.check_todos_start_at_one(trace)),
-        ("Structure Order", verifier.check_structure_order(trace)),
-    ]
+    # Get detailed results
+    details = verifier.detailed_check(trace)
     
-    for name, (passed, msg) in checks:
-        status = "✓" if passed else "✗"
-        print(f"  {status} {name}: {msg}")
+    # Blocks found
+    print(f"\n  Blocks parsed: {len(details['blocks'])}")
+    for block_type, size in details['blocks']:
+        print(f"    • {block_type} ({size} chars)")
     
-    # Todo satisfaction (special handling)
-    todos_ok, msg, defined, satisfied = verifier.check_todos_satisfied(trace)
-    status = "✓" if todos_ok else "✗"
-    print(f"  {status} Todos Satisfied: {msg}")
+    # Todos
+    print(f"\n  Todos:")
+    defined = details['defined_todos']
+    satisfied = details['satisfied_todos']
     if defined:
-        print(f"      Defined: {sorted(defined)}")
-        print(f"      Satisfied: {sorted(satisfied)}")
-        unsatisfied = defined - satisfied
+        print(f"    Defined: {sorted(defined)}")
+        print(f"    Satisfied: {sorted(satisfied)}")
+        unsatisfied = set(defined) - set(satisfied)
         if unsatisfied:
-            print(f"      Missing: {sorted(unsatisfied)}")
+            print(f"    ✗ Missing: {sorted(unsatisfied)}")
+        else:
+            print(f"    ✓ All todos satisfied")
+    else:
+        print(f"    (no todos defined)")
     
-    # Tag references
-    refs_ok, msg, defined_tags, referenced_tags = verifier.check_refs_valid(trace)
-    status = "✓" if refs_ok else "✗"
-    print(f"  {status} References Valid: {msg}")
-    if defined_tags or referenced_tags:
-        print(f"      Defined tags: {sorted(defined_tags)[:10]}{'...' if len(defined_tags) > 10 else ''}")
-        orphans = referenced_tags - defined_tags
-        orphans = {t for t in orphans if not t.startswith(('usr', 'sys'))}
-        if orphans:
-            print(f"      Orphan refs: {sorted(orphans)}")
+    # Tags
+    print(f"\n  Tags:")
+    defined_tags = set(details['defined_tags'])
+    referenced_tags = set(details['referenced_tags'])
+    print(f"    Defined: {len(defined_tags)}")
+    if verbose and defined_tags:
+        print(f"      {sorted(defined_tags)[:15]}{'...' if len(defined_tags) > 15 else ''}")
+    print(f"    Referenced: {len(referenced_tags)}")
     
-    # Total score
-    total, breakdown = verifier.compute_reward(trace)
-    print("-"*60)
-    print(f"  TOTAL SCORE: {total:.2f}")
-    print("  Breakdown:")
-    for key, val in breakdown.items():
-        print(f"    {key}: {val:+.2f}")
+    # Check for orphan references
+    filtered_refs = {t for t in referenced_tags if not re.match(r'^(usr|sys)\d+$', t)}
+    orphans = filtered_refs - defined_tags
+    if orphans:
+        print(f"    ✗ Orphan refs: {sorted(orphans)}")
+    else:
+        print(f"    ✓ All references valid")
+    
+    # Tools
+    print(f"\n  Tools:")
+    defined_tools = set(details.get('defined_tools', []))
+    called_tools = set(details.get('called_tools', []))
+    call_ids = set(details.get('call_ids', []))
+    result_ids = set(details.get('result_ids', []))
+    
+    print(f"    Defined: {sorted(defined_tools) if defined_tools else '(none)'}")
+    print(f"    Called: {sorted(called_tools) if called_tools else '(none)'}")
+    
+    # Check for hallucinated tools
+    if called_tools:
+        if defined_tools:
+            hallucinated = called_tools - defined_tools
+            if hallucinated:
+                print(f"    ✗ HALLUCINATED tools: {sorted(hallucinated)}")
+            else:
+                print(f"    ✓ All called tools are defined")
+        else:
+            print(f"    ✗ HALLUCINATED: tools called but none defined!")
+    
+    # Check call/result matching
+    if call_ids or result_ids:
+        print(f"    Call IDs: {sorted(call_ids) if call_ids else '(none)'}")
+        print(f"    Result IDs: {sorted(result_ids) if result_ids else '(none)'}")
+        orphan_results = result_ids - call_ids
+        missing_results = call_ids - result_ids
+        if orphan_results:
+            print(f"    ✗ Orphan results (no matching call): {sorted(orphan_results)}")
+        if missing_results:
+            print(f"    ⚠ Calls without results: {sorted(missing_results)}")
+        if not orphan_results and not missing_results and call_ids:
+            print(f"    ✓ All calls have matching results")
+    
+    # Errors and warnings
+    if details['errors']:
+        print(f"\n  ✗ Errors ({len(details['errors'])}):")
+        for err in details['errors'][:5]:
+            print(f"    • {err}")
+        if len(details['errors']) > 5:
+            print(f"    ... and {len(details['errors']) - 5} more")
+    
+    if details['warnings']:
+        print(f"\n  ⚠ Warnings ({len(details['warnings'])}):")
+        for warn in details['warnings'][:5]:
+            print(f"    • {warn}")
+        if len(details['warnings']) > 5:
+            print(f"    ... and {len(details['warnings']) - 5} more")
+    
+    # Reward breakdown
+    print("\n" + "-"*60)
+    print(f"  TOTAL SCORE: {details['score']:.2f}")
+    print("  Reward breakdown:")
+    for key, val in details['rewards'].items():
+        status = "✓" if val > 0 else ("~" if val == 0 else "✗")
+        print(f"    {status} {key}: {val:+.2f}")
 
 
 def print_judge_results(prompt: str, trace: str, model: str = "gpt-4o-mini"):
@@ -107,7 +165,7 @@ def print_judge_results(prompt: str, trace: str, model: str = "gpt-4o-mini"):
         print(f"  Error: {e}")
 
 
-def interactive_mode(use_judge: bool = False, judge_model: str = "gpt-4o-mini"):
+def interactive_mode(use_judge: bool = False, judge_model: str = "gpt-4o-mini", verbose: bool = False):
     """Interactive evaluation mode."""
     print("Interactive TASK Evaluation")
     print("="*60)
@@ -133,7 +191,7 @@ def interactive_mode(use_judge: bool = False, judge_model: str = "gpt-4o-mini"):
         if not trace.strip():
             continue
         
-        print_verifier_results(trace)
+        print_verifier_results(trace, verbose)
         
         if use_judge:
             # For interactive, use trace as prompt too
@@ -150,10 +208,11 @@ def main():
     parser.add_argument("--judge-model", type=str, default="gpt-4o-mini", help="LLM judge model")
     parser.add_argument("--jsonl", type=str, help="Evaluate traces from JSONL file")
     parser.add_argument("--limit", type=int, default=10, help="Limit for JSONL evaluation")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output with more details")
     args = parser.parse_args()
     
     if args.interactive:
-        interactive_mode(args.judge, args.judge_model)
+        interactive_mode(args.judge, args.judge_model, args.verbose)
         return
     
     if args.jsonl:
@@ -163,6 +222,7 @@ def main():
         
         verifier = TaskVerifier()
         scores = []
+        parse_errors = 0
         
         with open(args.jsonl) as f:
             for i, line in enumerate(f):
@@ -171,20 +231,32 @@ def main():
                 try:
                     item = json.loads(line)
                     trace = item.get("trace", "")
-                    score, _ = verifier.compute_reward(trace)
+                    score, rewards = verifier.compute_reward(trace)
                     scores.append(score)
+                    
+                    # Check for parse errors
+                    if rewards.get('parse_valid', 1.0) < 0:
+                        parse_errors += 1
                     
                     # Show per-item
                     status = "✓" if score > 1.5 else ("~" if score > 0 else "✗")
                     print(f"  {status} Trace {i+1}: {score:.2f}")
+                    
+                    if args.verbose and score < 1.0:
+                        for key, val in rewards.items():
+                            if val < 0:
+                                print(f"      {key}: {val:+.2f}")
+                                
                 except Exception as e:
                     print(f"  ✗ Trace {i+1}: Error - {e}")
         
         if scores:
             print("-"*60)
-            print(f"  Average: {sum(scores)/len(scores):.2f}")
+            print(f"  Total evaluated: {len(scores)}")
+            print(f"  Average score: {sum(scores)/len(scores):.2f}")
             print(f"  Min: {min(scores):.2f}")
             print(f"  Max: {max(scores):.2f}")
+            print(f"  Parse errors: {parse_errors}/{len(scores)}")
             print(f"  Passing (>1.5): {sum(1 for s in scores if s > 1.5)}/{len(scores)}")
         return
     
@@ -209,7 +281,7 @@ def main():
         prompt = trace  # Use trace as prompt if not specified
     
     # Evaluate
-    print_verifier_results(trace)
+    print_verifier_results(trace, args.verbose)
     
     if args.judge:
         print_judge_results(prompt, trace, args.judge_model)
