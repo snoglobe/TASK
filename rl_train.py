@@ -832,15 +832,15 @@ class LLMJudge:
     For distributed training (accelerate launch), use either:
     1. --judge-backend openai (simplest)
     2. --judge-backend vllm_server --judge-url http://localhost:8000
-       After starting server: vllm serve PrimeIntellect/INTELLECT-3 --tensor-parallel-size 6
+       After starting server: vllm serve MiniMaxAI/MiniMax-M2 --tensor-parallel-size 6
     
     For local models on H200 cluster:
-    - 6x H200 (846GB) can run PrimeIntellect/INTELLECT-3 at BF16 or Llama-3.1-405B at FP8
+    - 6x H200 (846GB) can run MiniMaxAI/MiniMax-M2 at BF16 or Llama-3.1-405B at FP8
     """
     
     def __init__(
         self,
-        model: str = "PrimeIntellect/INTELLECT-3",
+        model: str = "MiniMaxAI/MiniMax-M2",
         backend: str = "vllm",  # "vllm", "vllm_server", or "openai"
         api_key: Optional[str] = None,
         cache_dir: str = ".cache/judge",
@@ -1274,7 +1274,7 @@ class PromptGenerator:
     def __init__(
         self,
         llm_instance=None,  # Can share vLLM instance with judge
-        model: str = "PrimeIntellect/INTELLECT-3",
+        model: str = "MiniMaxAI/MiniMax-M2",
         backend: str = "vllm",
         api_key: Optional[str] = None,
         tensor_parallel_size: int = 6,
@@ -1697,7 +1697,7 @@ class HybridRewardFunction:
     def __init__(
         self,
         judge_rate: float = 0.0,  # Fraction of samples to judge (0 = disabled)
-        judge_model: str = "PrimeIntellect/INTELLECT-3",
+        judge_model: str = "MiniMaxAI/MiniMax-M2",
         judge_backend: str = "vllm_server",  # "vllm_server", "vllm", or "openai"
         judge_weight: float = 1.0,  # Weight of LLM score vs verifier score
         judge_gpus: int = 6,  # GPUs for judge model
@@ -1872,7 +1872,7 @@ class RLConfig:
     
     # LLM Judge
     judge_rate: float = 0.0  # Fraction of samples to judge (0 = disabled)
-    judge_model: str = "PrimeIntellect/INTELLECT-3"
+    judge_model: str = "MiniMaxAI/MiniMax-M2"
     judge_backend: str = "vllm_server"  # "vllm_server", "vllm", or "openai"
     judge_url: str = "http://localhost:8000/v1"  # URL for vllm_server
     judge_weight: float = 1.0  # Weight of LLM score vs verifier score
@@ -1916,7 +1916,7 @@ def main():
     # LLM Judge arguments
     parser.add_argument("--judge-rate", type=float, default=0.0,
                         help="Fraction of samples to evaluate with LLM judge (0=disabled, 0.1=10%%)")
-    parser.add_argument("--judge-model", type=str, default="PrimeIntellect/INTELLECT-3",
+    parser.add_argument("--judge-model", type=str, default="MiniMaxAI/MiniMax-M2",
                         help="Model for LLM judge (HF model ID for vllm, or OpenAI model name)")
     parser.add_argument("--judge-backend", type=str, default="vllm_server", 
                         choices=["vllm", "vllm_server", "openai"],
