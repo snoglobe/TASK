@@ -1455,32 +1455,56 @@ class PromptGenerator:
             response_text = outputs[0].outputs[0].text
         elif self.client is not None:
             # Use OpenAI-compatible API (openai or vllm_server)
-            # vLLM supports guided generation via extra_body
             extra_body = None
             response_format = None
             
             if self.backend == "vllm_server":
-                # vLLM uses guided_json in extra_body
-                extra_body = {"guided_json": PROMPT_GEN_JSON_SCHEMA}
+                # vLLM: try without guided_json first as it can cause issues
+                # Just ask for JSON in the prompt and parse it
+                pass
             else:
                 # OpenAI uses response_format
                 response_format = {"type": "json_object"}
             
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": PROMPT_GEN_SYSTEM},
-                    {"role": "user", "content": user_msg}
-                ],
-                response_format=response_format,
-                temperature=0.9,
-                max_tokens=512,
-                extra_body=extra_body,
-            )
-            response_text = response.choices[0].message.content
-            if response_text is None:
-                print(f"    [PromptGen] Warning: Got None response")
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": PROMPT_GEN_SYSTEM},
+                        {"role": "user", "content": user_msg}
+                    ],
+                    response_format=response_format,
+                    temperature=0.9,
+                    max_tokens=1024,  # Increased from 512
+                    extra_body=extra_body,
+                )
+            except Exception as e:
+                print(f"    [PromptGen] API error: {e}")
                 return None
+            
+            # Debug: inspect the full response
+            if not response.choices:
+                print(f"    [PromptGen] No choices in response: {response}")
+                return None
+            
+            choice = response.choices[0]
+            response_text = choice.message.content
+            finish_reason = choice.finish_reason
+            
+            if response_text is None:
+                print(f"    [PromptGen] None content, finish_reason={finish_reason}")
+                print(f"    [PromptGen] Full message: {choice.message}")
+                print(f"    [PromptGen] Full choice: {choice}")
+                # Try to get any other info
+                if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls:
+                    print(f"    [PromptGen] Has tool_calls instead of content")
+                if hasattr(choice.message, 'refusal') and choice.message.refusal:
+                    print(f"    [PromptGen] Refusal: {choice.message.refusal}")
+                return None
+            
+            if finish_reason == "length":
+                print(f"    [PromptGen] Warning: truncated (hit max_tokens)")
+                # Still try to parse partial JSON
         else:
             raise RuntimeError("PromptGenerator has no LLM or client configured")
         
