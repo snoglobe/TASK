@@ -1585,6 +1585,12 @@ def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs
     """Wrapper for GRPO trainer compatibility with dashboard logging."""
     global _reward_fn, _dashboard, _step_counter
     
+    # Debug: show when reward function is first called
+    if _step_counter == 0:
+        print(f"\n[Reward] First call! {len(completions)} completions to evaluate")
+        if completions:
+            print(f"[Reward] Sample completion length: {len(completions[0])} chars")
+    
     verifier = TaskVerifier()
     
     if _reward_fn is None:
@@ -1599,15 +1605,19 @@ def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs
         
         # Get judge score if enabled
         judge_score = None
+        judge_breakdown = None
         if _reward_fn.judge and random.random() < _reward_fn.judge_rate:
-            judge_result = _reward_fn.judge.judge(prompt, completion)
-            if judge_result:
-                judge_score = sum(judge_result.values()) / len(judge_result) / 10.0  # Normalize to 0-1
+            try:
+                judge_score, judge_breakdown = _reward_fn.judge.judge(prompt, completion)
+            except Exception as e:
+                print(f"[Judge] Error: {e}")
+                judge_score = None
         
         # Compute final reward
         final_reward = verifier_score
         if judge_score is not None:
-            final_reward += _reward_fn.judge_weight * (judge_score * 5 - 2.5)  # Scale judge to similar range
+            # Judge score is already 0-1, scale to similar range as verifier
+            final_reward += _reward_fn.judge_weight * (judge_score * 5 - 2.5)
         
         rewards.append(final_reward)
         
