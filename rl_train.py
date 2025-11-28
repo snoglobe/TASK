@@ -1455,30 +1455,47 @@ class PromptGenerator:
             response_text = outputs[0].outputs[0].text
         elif self.client is not None:
             # Use OpenAI-compatible API (openai or vllm_server)
+            # vLLM supports guided generation via extra_body
+            extra_body = None
+            response_format = None
+            
+            if self.backend == "vllm_server":
+                # vLLM uses guided_json in extra_body
+                extra_body = {"guided_json": PROMPT_GEN_JSON_SCHEMA}
+            else:
+                # OpenAI uses response_format
+                response_format = {"type": "json_object"}
+            
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": PROMPT_GEN_SYSTEM},
                     {"role": "user", "content": user_msg}
                 ],
-                response_format={"type": "json_object"} if self.backend == "openai" else None,
+                response_format=response_format,
                 temperature=0.9,
                 max_tokens=512,
+                extra_body=extra_body,
             )
             response_text = response.choices[0].message.content
             if response_text is None:
-                # Some models return content in a different field or as empty
+                print(f"    [PromptGen] Warning: Got None response")
                 return None
         else:
             raise RuntimeError("PromptGenerator has no LLM or client configured")
         
         if not response_text:
+            print(f"    [PromptGen] Warning: Empty response")
             return None
         
         scenario = self._parse_scenario(response_text)
         if scenario:
             self.generated += 1
             return self._format_prompt(scenario)
+        else:
+            # Debug: show what failed to parse
+            preview = response_text[:200].replace('\n', ' ') if response_text else "None"
+            print(f"    [PromptGen] Failed to parse: {preview}...")
         return None
     
     def generate_batch(self, n: int, **kwargs) -> list[str]:
@@ -1523,18 +1540,19 @@ class PromptGenerator:
             results = []
             failures = 0
             for i in range(n):
-                if (i + 1) % 10 == 0:
-                    print(f"    Generated {len(results)}/{n} prompts ({failures} failures)...")
                 try:
                     prompt = self.generate_one(**kwargs)
                     if prompt:
                         results.append(prompt)
+                        # Log each successful prompt (truncated)
+                        preview = prompt[:150].replace('\n', ' ')
+                        print(f"    [{len(results)}/{n}] ✓ {preview}...")
                     else:
                         failures += 1
+                        print(f"    [{i+1}/{n}] ✗ Failed to parse response")
                 except Exception as e:
                     failures += 1
-                    if failures <= 3:  # Only log first few failures
-                        print(f"    [PromptGen] Error: {e}")
+                    print(f"    [{i+1}/{n}] ✗ Error: {e}")
             print(f"    Done: {len(results)} prompts generated ({failures} failures)")
             return results
     
