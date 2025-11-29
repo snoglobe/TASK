@@ -766,6 +766,23 @@ class TaskVerifier:
             rewards['additional_errors'] = -min(error_count * 0.2, 0.5)
             total += rewards['additional_errors']
         
+        # Check for proper ending - should end shortly after response block
+        if has_response:
+            response_idx = block_types.index('response')
+            blocks_after_response = len(block_types) - response_idx - 1
+            if blocks_after_response == 0:
+                rewards['clean_ending'] = 0.3  # Good - ends at response
+            elif blocks_after_response <= 2:
+                rewards['clean_ending'] = 0.1  # OK - minor trailing content
+            else:
+                rewards['clean_ending'] = -0.5  # Bad - rambling after response
+            total += rewards['clean_ending']
+            
+            # Penalize extremely long outputs (likely didn't stop properly)
+            if len(trace) > 100000:  # ~25K tokens
+                rewards['output_length'] = -1.0  # Penalty for not stopping
+                total += rewards['output_length']
+        
         return total, rewards
     
     def detailed_check(self, trace: str) -> dict:
@@ -831,7 +848,7 @@ class LLMJudge:
     
     For distributed training (accelerate launch), use either:
     1. --judge-backend openai (simplest)
-    2. --judge-backend vllm_server --judge-url http://localhost:8000
+    2. --judge-backend vllm_server --judge-url http://localhost:8100
        After starting server: vllm serve MiniMaxAI/MiniMax-M2 --tensor-parallel-size 6
     
     For local models on H200 cluster:
@@ -868,7 +885,7 @@ class LLMJudge:
             # Connect to external vLLM server via OpenAI-compatible API
             if not OPENAI_AVAILABLE:
                 raise ImportError("openai package required for vllm_server backend")
-            base_url = server_url or "http://localhost:8000/v1"
+            base_url = server_url or "http://localhost:8100/v1"
             print(f"[Judge] Connecting to vLLM server at {base_url}")
             self.client = OpenAI(base_url=base_url, api_key="not-needed")
             self._llm = None
@@ -1307,7 +1324,7 @@ class PromptGenerator:
             # Connect to external vLLM server via OpenAI-compatible API
             if not OPENAI_AVAILABLE:
                 raise ImportError("openai package required for vllm_server backend")
-            base_url = server_url or "http://localhost:8000/v1"
+            base_url = server_url or "http://localhost:8100/v1"
             print(f"[PromptGen] Connecting to vLLM server at {base_url}")
             self.client = OpenAI(base_url=base_url, api_key="not-needed")
         elif backend == "openai":
@@ -1776,6 +1793,7 @@ def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs
     if completions:
         print(f"[DEBUG] Completion lengths (chars): {[len(c) for c in completions]}", flush=True)
         print(f"[DEBUG] First 300 chars of completion 0:\n{completions[0][:300]}", flush=True)
+        print(f"[DEBUG] Last 200 chars of completion 0:\n{completions[0][-200:]}", flush=True)
     
     verifier = TaskVerifier()
     
@@ -1890,6 +1908,7 @@ class RLConfig:
     temperature: float = 0.8
     num_generations: int = 4  # Number of completions per prompt for GRPO
     use_vllm: bool = True  # Use vLLM for fast generation (5-20x faster)
+    vllm_port: int = 8000  # Port for TRL's vLLM server
     
     # Checkpointing
     save_steps: int = 100
@@ -1899,7 +1918,7 @@ class RLConfig:
     judge_rate: float = 0.0  # Fraction of samples to judge (0 = disabled)
     judge_model: str = "MiniMaxAI/MiniMax-M2"
     judge_backend: str = "vllm_server"  # "vllm_server", "vllm", or "openai"
-    judge_url: str = "http://localhost:8000/v1"  # URL for vllm_server
+    judge_url: str = "http://localhost:8100/v1"  # URL for vllm_server
     judge_weight: float = 1.0  # Weight of LLM score vs verifier score
     judge_gpus: int = 6  # GPUs for judge model (when using vllm)
     judge_dtype: str = "bfloat16"  # "bfloat16", "float16", "auto"
@@ -1941,6 +1960,8 @@ def main():
                         help="Use vLLM for fast generation (default: True)")
     parser.add_argument("--no-vllm", action="store_true",
                         help="Disable vLLM, use HF generate instead (slower)")
+    parser.add_argument("--vllm-port", type=int, default=8000,
+                        help="Port for TRL's vLLM server (default: 8000)")
     
     # LLM Judge arguments
     parser.add_argument("--judge-rate", type=float, default=0.0,
@@ -1950,8 +1971,8 @@ def main():
     parser.add_argument("--judge-backend", type=str, default="vllm_server", 
                         choices=["vllm", "vllm_server", "openai"],
                         help="Backend: 'vllm_server' (external server, recommended), 'vllm' (in-process, conflicts with distributed!), 'openai' (API)")
-    parser.add_argument("--judge-url", type=str, default="http://localhost:8000/v1",
-                        help="URL for vllm_server backend (default: http://localhost:8000/v1)")
+    parser.add_argument("--judge-url", type=str, default="http://localhost:8100/v1",
+                        help="URL for vllm_server backend (default: http://localhost:8100/v1)")
     parser.add_argument("--judge-weight", type=float, default=1.0,
                         help="Weight of LLM judge score relative to verifier")
     parser.add_argument("--judge-gpus", type=int, default=6,
@@ -1996,6 +2017,7 @@ def main():
         num_generations=args.num_generations,
         max_new_tokens=args.max_new_tokens,
         use_vllm=args.use_vllm and not args.no_vllm,
+        vllm_port=args.vllm_port,
         judge_rate=args.judge_rate,
         judge_model=args.judge_model,
         judge_backend=args.judge_backend,
@@ -2108,8 +2130,11 @@ def main():
         logging_first_step=True,
         # vLLM for fast generation
         use_vllm=use_vllm,
-        vllm_device="cuda:0" if use_vllm else None,  # Dedicated GPU for vLLM
-        vllm_gpu_memory_utilization=0.85 if use_vllm else None,
+        # vllm_device="cuda:0" if use_vllm else None,  # Dedicated GPU for vLLM
+        vllm_gpu_memory_utilization=1 if use_vllm else None,
+        vllm_server_port=config.vllm_port if use_vllm else None,
+        # Stop sequences for TASK format
+        stop=["<|im_end|>", "<|endoftext|>"],
     )
     
     if use_vllm:
