@@ -1786,14 +1786,20 @@ def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs
     import time
     global _reward_fn, _dashboard, _step_counter, _is_main_process
     
-    # DEBUG: Print when reward function is called
+    # DEBUG: Log when reward function is called
     t0 = time.time()
-    print(f"\n[DEBUG] ===== REWARD FUNCTION CALLED =====", flush=True)
-    print(f"[DEBUG] Num completions: {len(completions)}", flush=True)
-    if completions:
-        print(f"[DEBUG] Completion lengths (chars): {[len(c) for c in completions]}", flush=True)
-        print(f"[DEBUG] First 300 chars of completion 0:\n{completions[0][:300]}", flush=True)
-        print(f"[DEBUG] Last 200 chars of completion 0:\n{completions[0][-200:]}", flush=True)
+    # Only print debug if no dashboard (dashboard handles display)
+    if _dashboard is None:
+        print(f"\n[DEBUG] ===== REWARD FUNCTION CALLED =====", flush=True)
+        print(f"[DEBUG] Num completions: {len(completions)}", flush=True)
+        if completions:
+            print(f"[DEBUG] Completion lengths (chars): {[len(c) for c in completions]}", flush=True)
+            print(f"[DEBUG] First 300 chars of completion 0:\n{completions[0][:300]}", flush=True)
+            print(f"[DEBUG] Last 200 chars of completion 0:\n{completions[0][-200:]}", flush=True)
+    elif _dashboard:
+        _dashboard.log(f"Reward fn called: {len(completions)} completions")
+        if completions:
+            _dashboard.log(f"Completion lengths: {[len(c) for c in completions]}")
     
     verifier = TaskVerifier()
     
@@ -1841,8 +1847,11 @@ def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs
                 judge_score=judge_score,
             )
     
-    print(f"[DEBUG] Reward computation took {time.time() - t0:.2f}s", flush=True)
-    print(f"[DEBUG] Rewards: {rewards}", flush=True)
+    if _dashboard is None:
+        print(f"[DEBUG] Reward computation took {time.time() - t0:.2f}s", flush=True)
+        print(f"[DEBUG] Rewards: {rewards}", flush=True)
+    elif _dashboard:
+        _dashboard.log(f"Rewards computed in {time.time() - t0:.2f}s: {[f'{r:.2f}' for r in rewards]}")
     return rewards
 
 
@@ -2157,20 +2166,19 @@ def main():
     
     # Train
     log("\nStarting GRPO training...")
-    print(f"[DEBUG] Dataset size: {len(dataset)}", flush=True)
-    print(f"[DEBUG] Num epochs: {config.num_train_epochs}", flush=True)
-    print(f"[DEBUG] Batch size: {config.per_device_train_batch_size}", flush=True)
-    print(f"[DEBUG] Num generations: {config.num_generations}", flush=True)
-    print(f"[DEBUG] Max new tokens: {config.max_new_tokens}", flush=True)
+    log(f"Dataset size: {len(dataset)}")
+    log(f"Num epochs: {config.num_train_epochs}")
+    log(f"Batch size: {config.per_device_train_batch_size}")
+    log(f"Num generations: {config.num_generations}")
+    log(f"Max new tokens: {config.max_new_tokens}")
     
     # Start dashboard
     total_steps = len(dataset) * config.num_train_epochs
-    print(f"[DEBUG] Total steps: {total_steps}", flush=True)
+    log(f"Total steps: {total_steps}")
     if _dashboard:
         _dashboard.start(total_steps=total_steps)
-        print("[DEBUG] Dashboard started", flush=True)
     
-    print("[DEBUG] Calling trainer.train()...", flush=True)
+    log("Calling trainer.train()...")
     try:
         trainer.train()
     except KeyboardInterrupt:

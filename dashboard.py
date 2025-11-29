@@ -377,13 +377,10 @@ class TrainingDashboard:
             self._render(),
             console=self.console,
             refresh_per_second=4,
-            screen=False,
+            screen=True,  # Take over the terminal for proper display
             transient=False,
-            vertical_overflow="visible",
         )
         self._live.start()
-        # Clear screen once at start
-        self.console.clear()
     
     def stop(self):
         """Stop the live dashboard."""
@@ -504,6 +501,10 @@ class SimpleDashboard:
             self.step = step
         if loss is not None and step and step % 10 == 0:
             print(f"  Step {step}: loss={loss:.4f}, reward_mean={reward_mean:.2f}")
+    
+    def log(self, message: str):
+        """Log a message to console."""
+        print(f"[LOG] {message}")
 
 
 def create_dashboard(use_rich: bool = True, **kwargs):
