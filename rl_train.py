@@ -1761,17 +1761,12 @@ class HybridRewardFunction:
 _reward_fn: Optional[HybridRewardFunction] = None
 _dashboard = None
 _step_counter = 0
+_is_main_process = True  # Set in main()
 
 
 def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs) -> list[float]:
     """Wrapper for GRPO trainer compatibility with dashboard logging."""
-    global _reward_fn, _dashboard, _step_counter
-    
-    # Debug: show when reward function is first called
-    if _step_counter == 0:
-        print(f"\n[Reward] First call! {len(completions)} completions to evaluate")
-        if completions:
-            print(f"[Reward] Sample completion length: {len(completions[0])} chars")
+    global _reward_fn, _dashboard, _step_counter, _is_main_process
     
     verifier = TaskVerifier()
     
@@ -1785,10 +1780,10 @@ def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs
         # Get verifier score and breakdown
         verifier_score, verifier_breakdown = verifier.compute_reward(completion)
         
-        # Get judge score if enabled
+        # Get judge score if enabled (only on main process to avoid duplicate API calls)
         judge_score = None
         judge_breakdown = None
-        if _reward_fn.judge and random.random() < _reward_fn.judge_rate:
+        if _is_main_process and _reward_fn.judge and random.random() < _reward_fn.judge_rate:
             try:
                 judge_score, judge_breakdown = _reward_fn.judge.judge(prompt, completion)
             except Exception as e:
@@ -1803,8 +1798,8 @@ def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs
         
         rewards.append(final_reward)
         
-        # Log to dashboard
-        if _dashboard is not None:
+        # Log to dashboard (only on main process)
+        if _is_main_process and _dashboard is not None:
             _step_counter += 1
             _dashboard.log_generation(
                 step=_step_counter,
@@ -1958,6 +1953,12 @@ def main():
     
     args = parser.parse_args()
     
+    # Helper to only print on main process
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    def log(msg):
+        if local_rank == 0:
+            print(msg)
+    
     config = RLConfig(
         model_path=args.model,
         data_path=args.data,
@@ -1978,46 +1979,46 @@ def main():
         openai_api_key=args.openai_api_key,
     )
     
-    print("="*60)
-    print("GRPO Training for TASK Format")
-    print("="*60)
-    print(f"Model: {config.model_path}")
-    if config.generate_prompts:
-        print(f"Prompts: GENERATING {config.prompt_gen_count} on-the-fly")
-        print(f"  Tool rate: {config.prompt_tool_rate*100:.0f}%")
-    else:
-        print(f"Data: {config.data_path}")
-    print(f"Output: {config.output_dir}")
-    print(f"Learning rate: {config.learning_rate}")
-    print(f"Num generations per prompt: {config.num_generations}")
-    print("-"*60)
-    if config.judge_rate > 0 or config.generate_prompts:
-        print(f"LLM (Judge/Generator): ENABLED")
-        print(f"  Backend: {config.judge_backend}")
-        print(f"  Model: {config.judge_model}")
-        if config.judge_rate > 0:
-            print(f"  Judge rate: {config.judge_rate*100:.0f}% of samples")
-            print(f"  Judge weight: {config.judge_weight}")
+    log("="*60)
+    log("GRPO Training for TASK Format")
+    log("="*60)
+    log(f"Model: {config.model_path}")
+    log(f"Data: {config.data_path}")
+    log(f"Output: {config.output_dir}")
+    log(f"Learning rate: {config.learning_rate}")
+    log(f"Num generations per prompt: {config.num_generations}")
+    log("-"*60)
+    if config.judge_rate > 0:
+        log(f"LLM Judge: ENABLED")
+        log(f"  Backend: {config.judge_backend}")
+        log(f"  Model: {config.judge_model}")
+        log(f"  Judge rate: {config.judge_rate*100:.0f}% of samples")
+        log(f"  Judge weight: {config.judge_weight}")
         if config.judge_backend == "vllm":
-            print(f"  GPUs: {config.judge_gpus}")
-            print(f"  Dtype: {config.judge_dtype}")
+            log(f"  GPUs: {config.judge_gpus}")
+            log(f"  Dtype: {config.judge_dtype}")
     else:
-        print(f"LLM Judge: DISABLED (verifier only)")
-    print("="*60)
+        log(f"LLM Judge: DISABLED (verifier only)")
+    log("="*60)
     
-    # Initialize dashboard if requested
-    global _dashboard
+    # Determine if this is the main process (rank 0)
+    global _dashboard, _is_main_process
+    _is_main_process = (local_rank == 0)
+    
+    # Initialize dashboard if requested (only on main process)
     use_dashboard = args.dashboard or (DASHBOARD_AVAILABLE and not args.no_dashboard)
-    if use_dashboard:
+    if use_dashboard and _is_main_process:
         if not DASHBOARD_AVAILABLE:
-            print("Warning: Dashboard requested but 'rich' not installed. Run: pip install rich")
+            log("Warning: Dashboard requested but 'rich' not installed. Run: pip install rich")
             _dashboard = None
         else:
             _dashboard = create_dashboard(use_rich=True)
-            print("\n✓ Dashboard enabled (live TUI)")
+            log("\n✓ Dashboard enabled (live TUI)")
+    elif not _is_main_process:
+        _dashboard = None  # Explicitly disable on non-main processes
     
     # Initialize hybrid reward function
-    print("\nInitializing reward function...")
+    log("\nInitializing reward function...")
     _reward_fn = HybridRewardFunction(
         judge_rate=config.judge_rate,
         judge_model=config.judge_model,
@@ -2030,7 +2031,7 @@ def main():
     )
     
     # Load model and tokenizer
-    print("\nLoading model...")
+    log("\nLoading model...")
     tokenizer = AutoTokenizer.from_pretrained(config.model_path, trust_remote_code=False)
     model = AutoModelForCausalLM.from_pretrained(
         config.model_path,
@@ -2044,14 +2045,14 @@ def main():
     
     # Load prompts from file
     # For generating prompts, use generate_prompts.py first (avoids NCCL timeout)
-    print("\nLoading prompts from file...")
+    log("\nLoading prompts from file...")
     prompts = load_prompts(config.data_path, config.max_samples)
     
     if len(prompts) == 0:
-        print("ERROR: No prompts loaded!")
-        print("Generate prompts first with:")
-        print(f"  python generate_prompts.py --count 1000 --output prompts.jsonl")
-        print(f"Then run: accelerate launch rl_train.py --data prompts.jsonl")
+        log("ERROR: No prompts loaded!")
+        log("Generate prompts first with:")
+        log(f"  python generate_prompts.py --count 1000 --output prompts.jsonl")
+        log(f"Then run: accelerate launch rl_train.py --data prompts.jsonl")
         return
     
     dataset = Dataset.from_list(prompts)
@@ -2088,7 +2089,7 @@ def main():
     )
     
     # Train
-    print("\nStarting GRPO training...")
+    log("\nStarting GRPO training...")
     
     # Start dashboard
     total_steps = len(dataset) * config.num_train_epochs
@@ -2104,24 +2105,25 @@ def main():
         if _dashboard:
             _dashboard.stop()
         
-        # Print stats
-        print("\n" + "="*60)
-        print("Training Statistics")
-        print("="*60)
-        
-        if _reward_fn:
-            stats = _reward_fn.get_stats()
-            if stats.get('judge_enabled'):
-                print(f"Judge API calls: {stats.get('calls', 0)}")
-                print(f"Judge cache hits: {stats.get('cache_hits', 0)}")
-                print(f"Judge cache rate: {stats.get('cache_rate', 0)*100:.1f}%")
+        # Print stats (only on main process)
+        if _is_main_process:
+            print("\n" + "="*60)
+            print("Training Statistics")
+            print("="*60)
+            
+            if _reward_fn:
+                stats = _reward_fn.get_stats()
+                if stats.get('judge_enabled'):
+                    print(f"Judge API calls: {stats.get('calls', 0)}")
+                    print(f"Judge cache hits: {stats.get('cache_hits', 0)}")
+                    print(f"Judge cache rate: {stats.get('cache_rate', 0)*100:.1f}%")
     
-    # Save
-    print(f"\nSaving model to {config.output_dir}/final...")
+    # Save (trainer handles distributed saving)
+    log(f"\nSaving model to {config.output_dir}/final...")
     trainer.save_model(f"{config.output_dir}/final")
     tokenizer.save_pretrained(f"{config.output_dir}/final")
     
-    print("Done!")
+    log("Done!")
 
 
 if __name__ == "__main__":

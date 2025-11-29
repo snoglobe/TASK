@@ -61,19 +61,23 @@ class RewardGraph:
     
     BARS = " ▁▂▃▄▅▆▇█"
     
-    def __init__(self, width: int = 60, history: int = 100):
+    def __init__(self, width: int = 60, history: int = 5000):
         self.width = width
         self.history = history
         self.values = deque(maxlen=history)
         self.min_val = -3.0
         self.max_val = 4.0
+        self._total_count = 0  # Total values ever added
     
     def add(self, value: float):
         self.values.append(value)
-        # Auto-adjust scale
+        self._total_count += 1
+        # Auto-adjust scale based on actual values
         if self.values:
-            self.min_val = min(min(self.values) - 0.5, self.min_val)
-            self.max_val = max(max(self.values) + 0.5, self.max_val)
+            actual_min = min(self.values)
+            actual_max = max(self.values)
+            self.min_val = min(actual_min - 0.5, -3.0)
+            self.max_val = max(actual_max + 0.5, 4.0)
     
     def render(self) -> str:
         if not self.values:
@@ -101,12 +105,12 @@ class RewardGraph:
         
         return line
     
-    def stats(self) -> tuple[float, float, float]:
-        """Return (min, max, mean) of recent values."""
+    def stats(self) -> tuple[float, float, float, int]:
+        """Return (min, max, mean, count) of all values."""
         if not self.values:
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0
         vals = list(self.values)
-        return min(vals), max(vals), sum(vals) / len(vals)
+        return min(vals), max(vals), sum(vals) / len(vals), self._total_count
 
 
 class TrainingDashboard:
@@ -153,18 +157,19 @@ class TrainingDashboard:
         return " ".join(parts[:6])  # Limit to first 6
     
     def _make_layout(self) -> Layout:
-        """Create the dashboard layout."""
+        """Create the dashboard layout with fixed sizes to prevent jumping."""
         layout = Layout()
         
+        # Fixed heights prevent layout shifts
         layout.split_column(
             Layout(name="header", size=3),
-            Layout(name="main"),
+            Layout(name="main", size=30),  # Fixed height for main content
             Layout(name="footer", size=3),
         )
         
         layout["main"].split_row(
-            Layout(name="stats", ratio=1),
-            Layout(name="flow", ratio=2),
+            Layout(name="stats", size=45),  # Fixed width for stats
+            Layout(name="flow"),  # Flow takes remaining space
         )
         
         return layout
@@ -199,17 +204,17 @@ class TrainingDashboard:
         stats_table.add_row("Reward Mean", f"{self.reward_mean:.2f}")
         
         # Reward graph
-        r_min, r_max, r_mean = self.reward_graph.stats()
+        r_min, r_max, r_mean, r_count = self.reward_graph.stats()
         reward_section = Text()
         reward_section.append("Verifier Reward", style="bold yellow")
-        reward_section.append(f" (min:{r_min:.1f} max:{r_max:.1f} mean:{r_mean:.2f})\n", style="dim")
+        reward_section.append(f" (n={r_count} mean:{r_mean:.2f} range:[{r_min:.1f},{r_max:.1f}])\n", style="dim")
         reward_section.append(self.reward_graph.render(), style="green")
         
         # Judge graph
-        j_min, j_max, j_mean = self.judge_graph.stats()
+        j_min, j_max, j_mean, j_count = self.judge_graph.stats()
         judge_section = Text()
         judge_section.append("\n\nJudge Score", style="bold magenta")
-        judge_section.append(f" (min:{j_min:.1f} max:{j_max:.1f} mean:{j_mean:.2f})\n", style="dim")
+        judge_section.append(f" (n={j_count} mean:{j_mean:.2f} range:[{j_min:.1f},{j_max:.1f}])\n", style="dim")
         judge_section.append(self.judge_graph.render(), style="magenta")
         
         content = Group(
@@ -300,13 +305,20 @@ class TrainingDashboard:
         self.start_time = time.time()
         self._running = True
         
+        # Use vertical_overflow="visible" to prevent layout shifts
+        # Use refresh_per_second=4 for smoother updates
+        # screen=False to avoid full screen clear which causes flicker
         self._live = Live(
             self._render(),
             console=self.console,
-            refresh_per_second=2,
-            screen=True,
+            refresh_per_second=4,
+            screen=False,
+            transient=False,
+            vertical_overflow="visible",
         )
         self._live.start()
+        # Clear screen once at start
+        self.console.clear()
     
     def stop(self):
         """Stop the live dashboard."""
@@ -316,9 +328,12 @@ class TrainingDashboard:
             self._live = None
     
     def update(self):
-        """Force update the display."""
-        if self._live:
-            self._live.update(self._render())
+        """Force update the display (called automatically by Live)."""
+        if self._live and self._live.is_started:
+            try:
+                self._live.update(self._render(), refresh=True)
+            except Exception:
+                pass  # Ignore update errors during shutdown
     
     def log_generation(
         self,
@@ -354,7 +369,8 @@ class TrainingDashboard:
             valid_count = sum(1 for l in self.logs if l.verifier_score > 0)
             self.valid_rate = valid_count / len(self.logs) if self.logs else 0
         
-        self.update()
+        # Don't call update() here - let Live's auto-refresh handle it
+        # This prevents flicker from too-frequent redraws
     
     def update_stats(
         self,
@@ -371,7 +387,7 @@ class TrainingDashboard:
             if reward_mean is not None:
                 self.reward_mean = reward_mean
         
-        self.update()
+        # Don't call update() - let Live's auto-refresh handle it
 
 
 # =============================================================================
