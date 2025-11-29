@@ -1808,11 +1808,32 @@ def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs
         # Fallback to basic verifier if not initialized
         return [verifier.compute_reward(c)[0] for c in completions]
     
+    print(f"[DEBUG] Starting reward computation for {len(completions)} completions...", flush=True)
+    
     # Get rewards with dashboard logging
     rewards = []
-    for prompt, completion in zip(prompts, completions):
+    for idx, (prompt, completion) in enumerate(zip(prompts, completions)):
+        t_comp = time.time()
+        
+        # Truncate completion for parsing if too long (saves time, garbage after response anyway)
+        # Look for the last 'response' block and truncate after it
+        max_parse_len = 50000  # ~12K tokens should be enough for valid traces
+        parse_completion = completion
+        if len(completion) > max_parse_len:
+            # Try to find the last response block end
+            last_response = completion.rfind('response')
+            if last_response > 0:
+                # Find the closing bracket after response
+                end_idx = completion.find('」', last_response)
+                if end_idx > 0:
+                    parse_completion = completion[:end_idx + 500]  # Include some postfix ops
+            if len(parse_completion) > max_parse_len:
+                parse_completion = completion[:max_parse_len]
+            print(f"[DEBUG] Completion {idx}: truncated {len(completion)} -> {len(parse_completion)} chars for parsing", flush=True)
+        
         # Get verifier score and breakdown
-        verifier_score, verifier_breakdown = verifier.compute_reward(completion)
+        verifier_score, verifier_breakdown = verifier.compute_reward(parse_completion)
+        print(f"[DEBUG] Completion {idx}: verifier took {time.time() - t_comp:.2f}s, score={verifier_score:.2f}", flush=True)
         
         # Get judge score if enabled (only on main process to avoid duplicate API calls)
         judge_score = None
@@ -1832,6 +1853,12 @@ def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs
         if judge_score is not None:
             # Judge score is already 0-1, scale to similar range as verifier
             final_reward += _reward_fn.judge_weight * (judge_score * 5 - 2.5)
+        
+        # Penalty for not stopping (hitting max tokens)
+        # If completion is very long, model didn't learn to stop
+        if len(completion) > 100000:  # ~25K tokens
+            final_reward -= 2.0  # Strong penalty for not stopping
+            print(f"[DEBUG] Completion {idx}: penalty -2.0 for not stopping (len={len(completion)})", flush=True)
         
         rewards.append(final_reward)
         
@@ -2123,6 +2150,23 @@ def main():
     # Actually, let's just use it based on config
     use_vllm = config.use_vllm
     
+    # Set up vLLM sampling params with stop sequences
+    vllm_sampling_params = None
+    if use_vllm:
+        try:
+            from vllm import SamplingParams
+            # Stop on these tokens - critical for not generating forever!
+            stop_sequences = ["<|im_end|>", "<|endoftext|>", "<|im_start|>"]
+            vllm_sampling_params = SamplingParams(
+                stop=stop_sequences,
+                include_stop_str_in_output=False,
+                temperature=config.temperature,
+                max_tokens=config.max_new_tokens,
+            )
+            log(f"✓ vLLM sampling params: stop={stop_sequences}")
+        except ImportError:
+            log("Warning: vllm not available, can't set sampling params")
+    
     grpo_config = GRPOConfig(
         output_dir=config.output_dir,
         num_train_epochs=config.num_train_epochs,
@@ -2139,15 +2183,14 @@ def main():
         logging_first_step=True,
         # vLLM for fast generation
         use_vllm=use_vllm,
-        # vllm_device="cuda:0" if use_vllm else None,  # Dedicated GPU for vLLM
         vllm_gpu_memory_utilization=1 if use_vllm else None,
         vllm_server_port=config.vllm_port if use_vllm else None,
-        # Stop sequences for TASK format
-        #stop=["<|im_end|>", "<|endoftext|>"],
+        vllm_sampling_params=vllm_sampling_params,
     )
     
     if use_vllm:
         log(f"✓ Using vLLM for generation (5-20x faster)")
+        log(f"  Stop sequences: {['<|im_end|>', '<|endoftext|>', '<|im_start|>']}")
     
     # Trainer callbacks
     callbacks = []
