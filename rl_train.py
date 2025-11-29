@@ -31,6 +31,7 @@ Usage:
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -63,6 +64,9 @@ try:
     DASHBOARD_AVAILABLE = True
 except ImportError:
     DASHBOARD_AVAILABLE = False
+
+APPROX_CHARS_PER_TOKEN = 4.0  # Rough heuristic for mapping char limits to tokens
+SAFE_COMPLETION_TOKEN_LIMIT = 8192  # Hard ceiling to avoid runaway generations
 
 
 class DashboardCallback(TrainerCallback):
@@ -1892,25 +1896,40 @@ def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs
 # Dataset and Prompt Building
 # =============================================================================
 
-def load_prompts(data_path: str, max_samples: int = None) -> list[dict]:
-    """Load prompts from JSONL file.
+def load_prompts(
+    data_path: str,
+    max_samples: int = None,
+    max_trace_chars: Optional[int] = None,
+) -> tuple[list[dict], dict]:
+    """Load prompts from JSONL file with optional length filtering.
     
     Supports two formats:
     1. {"prompt": "..."} - direct prompts from generate_prompts.py
     2. {"trace": "..."} - processed traces with special tokens
     """
-    prompts = []
-    with open(data_path) as f:
-        for i, line in enumerate(f):
-            if max_samples and i >= max_samples:
+    prompts: list[dict] = []
+    stats = {
+        "total": 0,
+        "skipped_long": 0,
+        "skipped_malformed": 0,
+    }
+    
+    def within_limit(assistant_segment: str) -> bool:
+        if not max_trace_chars:
+            return True
+        return len(assistant_segment) <= max_trace_chars
+    
+    with open(data_path, encoding="utf-8") as f:
+        for line in f:
+            if max_samples and len(prompts) >= max_samples:
                 break
+            stats["total"] += 1
             try:
                 item = json.loads(line)
                 
-                # Format 1: Direct prompt (from generate_prompts.py)
+                # Format 1: Direct prompt (typically already truncated)
                 if "prompt" in item:
                     prompt = item["prompt"]
-                    # Wrap in chat template if not already
                     if not prompt.startswith("<|im_start|>"):
                         prompt = f"<|im_start|>system\n{prompt}\n<|im_end|>\n<|im_start|>assistant\n"
                     prompts.append({"prompt": prompt})
@@ -1918,15 +1937,22 @@ def load_prompts(data_path: str, max_samples: int = None) -> list[dict]:
                 
                 # Format 2: Trace format (from traces.processed.jsonl)
                 trace = item.get("trace", "")
-                if "<|im_start|>assistant" in trace:
-                    prompt_part = trace.split("<|im_start|>assistant")[0]
-                    prompt_part += "<|im_start|>assistant\n"
-                    prompts.append({"prompt": prompt_part})
-            except Exception as e:
-                pass  # Skip malformed lines
+                split = trace.split("<|im_start|>assistant", 1)
+                if len(split) != 2:
+                    stats["skipped_malformed"] += 1
+                    continue
+                
+                prompt_part, assistant_segment = split
+                if not within_limit(assistant_segment):
+                    stats["skipped_long"] += 1
+                    continue
+                
+                prompt_part += "<|im_start|>assistant\n"
+                prompts.append({"prompt": prompt_part})
+            except Exception:
+                stats["skipped_malformed"] += 1
     
-    print(f"Loaded {len(prompts)} prompts from {data_path}")
-    return prompts
+    return prompts, stats
 
 
 # =============================================================================
@@ -1972,6 +1998,8 @@ class RLConfig:
     prompt_tool_rate: float = 0.6  # Fraction of generated prompts that include tools
     
     max_samples: int = None  # Limit training samples
+    max_trace_chars: Optional[int] = 50000  # Skip assistant traces longer than this (chars)
+    allow_long_completions: bool = False  # Disable safety clamp on max_new_tokens
 
 
 def main():
@@ -1994,6 +2022,10 @@ def main():
                         help="Learning rate")
     parser.add_argument("--max-samples", type=int, default=None,
                         help="Limit number of training samples")
+    parser.add_argument("--max-trace-chars", type=int, default=50000,
+                        help="Skip traces whose assistant output exceeds this many characters (0 disables filtering)")
+    parser.add_argument("--allow-long-completions", action="store_true",
+                        help="Disable the safety clamp that prevents >8K token completions (not recommended)")
     parser.add_argument("--num-generations", type=int, default=4,
                         help="Number of completions per prompt for GRPO")
     parser.add_argument("--max-new-tokens", type=int, default=4096,
@@ -2068,7 +2100,29 @@ def main():
         judge_gpus=args.judge_gpus,
         judge_dtype=args.judge_dtype,
         openai_api_key=args.openai_api_key,
+        max_trace_chars=args.max_trace_chars if args.max_trace_chars and args.max_trace_chars > 0 else None,
+        allow_long_completions=args.allow_long_completions,
     )
+    
+    if config.allow_long_completions:
+        log("[Safety] Long completion clamp disabled (--allow-long-completions)")
+    else:
+        derived_cap = None
+        if config.max_trace_chars:
+            derived_cap = math.ceil(config.max_trace_chars / APPROX_CHARS_PER_TOKEN)
+        cap = SAFE_COMPLETION_TOKEN_LIMIT
+        if derived_cap:
+            cap = min(cap, derived_cap)
+        if config.max_new_tokens > cap:
+            approx_chars = int(cap * APPROX_CHARS_PER_TOKEN)
+            reasons = []
+            if derived_cap and cap == derived_cap:
+                reasons.append(f"trace limit ({config.max_trace_chars} chars)")
+            if cap == SAFE_COMPLETION_TOKEN_LIMIT:
+                reasons.append("default safety cap (8192 tokens)")
+            reason_str = " and ".join(reasons) if reasons else "safety cap"
+            log(f"[Safety] max_new_tokens {config.max_new_tokens} exceeds {reason_str}; clamping to {cap} tokens (~{approx_chars:,} chars). Use --allow-long-completions to override.")
+            config.max_new_tokens = cap
     
     log("="*60)
     log("GRPO Training for TASK Format")
@@ -2078,7 +2132,7 @@ def main():
     log(f"Output: {config.output_dir}")
     log(f"Learning rate: {config.learning_rate}")
     log(f"Num generations per prompt: {config.num_generations}")
-    log(f"Max completion length: {config.max_new_tokens}")
+    log(f"Max completion length: {config.max_new_tokens} tokens (~{int(config.max_new_tokens * APPROX_CHARS_PER_TOKEN):,} chars)")
     log(f"vLLM generation: {'ENABLED (fast)' if config.use_vllm else 'DISABLED (slow HF generate)'}")
     log("-"*60)
     if config.judge_rate > 0:
@@ -2139,7 +2193,16 @@ def main():
     # Load prompts from file
     # For generating prompts, use generate_prompts.py first (avoids NCCL timeout)
     log("\nLoading prompts from file...")
-    prompts = load_prompts(config.data_path, config.max_samples)
+    prompts, prompt_stats = load_prompts(
+        config.data_path,
+        config.max_samples,
+        config.max_trace_chars,
+    )
+    log(f"Loaded {len(prompts)} prompts from {config.data_path}")
+    if prompt_stats.get("skipped_long", 0) and config.max_trace_chars:
+        log(f"  Skipped {prompt_stats['skipped_long']} traces longer than {config.max_trace_chars} chars")
+    if prompt_stats.get("skipped_malformed", 0):
+        log(f"  Skipped {prompt_stats['skipped_malformed']} malformed lines")
     
     if len(prompts) == 0:
         log("ERROR: No prompts loaded!")
