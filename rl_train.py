@@ -1815,6 +1815,16 @@ def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs
     for idx, (prompt, completion) in enumerate(zip(prompts, completions)):
         t_comp = time.time()
         
+        # First, truncate at stop sequences if the model produced them
+        # (vLLM might not be respecting stop sequences)
+        for stop_seq in ["<|im_end|>", "<|endoftext|>", "<|im_start|>"]:
+            if stop_seq in completion:
+                stop_idx = completion.find(stop_seq)
+                if stop_idx > 0:
+                    completion = completion[:stop_idx]
+                    print(f"[DEBUG] Completion {idx}: truncated at {stop_seq} (pos {stop_idx})", flush=True)
+                    break
+        
         # Truncate completion for parsing if too long (saves time, garbage after response anyway)
         # Look for the last 'response' block and truncate after it
         max_parse_len = 50000  # ~12K tokens should be enough for valid traces
@@ -2153,9 +2163,24 @@ def main():
     # Stop sequences - critical for not generating forever!
     stop_sequences = ["<|im_end|>", "<|endoftext|>", "<|im_start|>"]
     
+    # Get stop token IDs from tokenizer (more reliable than string matching)
+    stop_token_ids = []
+    for seq in stop_sequences:
+        token_ids = tokenizer.encode(seq, add_special_tokens=False)
+        if token_ids:
+            stop_token_ids.append(token_ids[0])  # Usually single token
+    
+    # Also add EOS token ID
+    if tokenizer.eos_token_id and tokenizer.eos_token_id not in stop_token_ids:
+        stop_token_ids.append(tokenizer.eos_token_id)
+    
+    log(f"Stop token IDs: {stop_token_ids} (from {stop_sequences})")
+    
     # generation_kwargs passed to SamplingParams (vLLM) or GenerationConfig (HF)
     generation_kwargs = {
         "stop": stop_sequences,
+        "stop_token_ids": stop_token_ids,
+        "fix_mistral_regex": True,
     }
     
     grpo_config = GRPOConfig(
