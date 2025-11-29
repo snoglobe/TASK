@@ -1889,6 +1889,7 @@ class RLConfig:
     max_new_tokens: int = 4096
     temperature: float = 0.8
     num_generations: int = 4  # Number of completions per prompt for GRPO
+    use_vllm: bool = True  # Use vLLM for fast generation (5-20x faster)
     
     # Checkpointing
     save_steps: int = 100
@@ -1936,6 +1937,10 @@ def main():
                         help="Number of completions per prompt for GRPO")
     parser.add_argument("--max-new-tokens", type=int, default=4096,
                         help="Maximum tokens to generate")
+    parser.add_argument("--use-vllm", action="store_true", default=True,
+                        help="Use vLLM for fast generation (default: True)")
+    parser.add_argument("--no-vllm", action="store_true",
+                        help="Disable vLLM, use HF generate instead (slower)")
     
     # LLM Judge arguments
     parser.add_argument("--judge-rate", type=float, default=0.0,
@@ -1990,6 +1995,7 @@ def main():
         max_samples=args.max_samples,
         num_generations=args.num_generations,
         max_new_tokens=args.max_new_tokens,
+        use_vllm=args.use_vllm and not args.no_vllm,
         judge_rate=args.judge_rate,
         judge_model=args.judge_model,
         judge_backend=args.judge_backend,
@@ -2008,6 +2014,8 @@ def main():
     log(f"Output: {config.output_dir}")
     log(f"Learning rate: {config.learning_rate}")
     log(f"Num generations per prompt: {config.num_generations}")
+    log(f"Max completion length: {config.max_new_tokens}")
+    log(f"vLLM generation: {'ENABLED (fast)' if config.use_vllm else 'DISABLED (slow HF generate)'}")
     log("-"*60)
     if config.judge_rate > 0:
         log(f"LLM Judge: ENABLED")
@@ -2079,11 +2087,11 @@ def main():
     dataset = Dataset.from_list(prompts)
     
     # GRPO config
-    # Note: For multi-GPU, FSDP + generation is extremely slow.
-    # Options:
-    # 1. Use single GPU (model fits on one H200)
-    # 2. Use use_vllm=True for fast generation with separate vLLM process
-    # 3. Use DeepSpeed ZeRO-2 (keeps full model for inference)
+    # Use vLLM for fast generation (5-20x faster than HF generate)
+    use_vllm = config.use_vllm and not _is_main_process  # vLLM only on rank 0 causes issues
+    # Actually, let's just use it based on config
+    use_vllm = config.use_vllm
+    
     grpo_config = GRPOConfig(
         output_dir=config.output_dir,
         num_train_epochs=config.num_train_epochs,
@@ -2097,9 +2105,15 @@ def main():
         num_generations=config.num_generations,
         temperature=config.temperature,
         report_to="tensorboard",
-        # Reduce sync overhead - log less frequently
         logging_first_step=True,
+        # vLLM for fast generation
+        use_vllm=use_vllm,
+        vllm_device="cuda:0" if use_vllm else None,  # Dedicated GPU for vLLM
+        vllm_gpu_memory_utilization=0.85 if use_vllm else None,
     )
+    
+    if use_vllm:
+        log(f"✓ Using vLLM for generation (5-20x faster)")
     
     # Trainer callbacks
     callbacks = []
