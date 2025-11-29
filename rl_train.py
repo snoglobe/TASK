@@ -2150,22 +2150,13 @@ def main():
     # Actually, let's just use it based on config
     use_vllm = config.use_vllm
     
-    # Set up vLLM sampling params with stop sequences
-    vllm_sampling_params = None
-    if use_vllm:
-        try:
-            from vllm import SamplingParams
-            # Stop on these tokens - critical for not generating forever!
-            stop_sequences = ["<|im_end|>", "<|endoftext|>", "<|im_start|>"]
-            vllm_sampling_params = SamplingParams(
-                stop=stop_sequences,
-                include_stop_str_in_output=False,
-                temperature=config.temperature,
-                max_tokens=config.max_new_tokens,
-            )
-            log(f"✓ vLLM sampling params: stop={stop_sequences}")
-        except ImportError:
-            log("Warning: vllm not available, can't set sampling params")
+    # Stop sequences - critical for not generating forever!
+    stop_sequences = ["<|im_end|>", "<|endoftext|>", "<|im_start|>"]
+    
+    # generation_kwargs passed to SamplingParams (vLLM) or GenerationConfig (HF)
+    generation_kwargs = {
+        "stop": stop_sequences,
+    }
     
     grpo_config = GRPOConfig(
         output_dir=config.output_dir,
@@ -2185,12 +2176,13 @@ def main():
         use_vllm=use_vllm,
         vllm_gpu_memory_utilization=1 if use_vllm else None,
         vllm_server_port=config.vllm_port if use_vllm else None,
-        vllm_sampling_params=vllm_sampling_params,
+        # Stop sequences
+        generation_kwargs=generation_kwargs,
     )
     
     if use_vllm:
         log(f"✓ Using vLLM for generation (5-20x faster)")
-        log(f"  Stop sequences: {['<|im_end|>', '<|endoftext|>', '<|im_start|>']}")
+    log(f"Stop sequences: {stop_sequences}")
     
     # Trainer callbacks
     callbacks = []
