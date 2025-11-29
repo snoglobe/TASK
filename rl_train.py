@@ -1823,7 +1823,12 @@ def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs
 # =============================================================================
 
 def load_prompts(data_path: str, max_samples: int = None) -> list[dict]:
-    """Load prompts from processed traces (extract system + user only)."""
+    """Load prompts from JSONL file.
+    
+    Supports two formats:
+    1. {"prompt": "..."} - direct prompts from generate_prompts.py
+    2. {"trace": "..."} - processed traces with special tokens
+    """
     prompts = []
     with open(data_path) as f:
         for i, line in enumerate(f):
@@ -1831,15 +1836,24 @@ def load_prompts(data_path: str, max_samples: int = None) -> list[dict]:
                 break
             try:
                 item = json.loads(line)
-                trace = item.get("trace", "")
                 
-                # Extract system and user parts (before assistant)
+                # Format 1: Direct prompt (from generate_prompts.py)
+                if "prompt" in item:
+                    prompt = item["prompt"]
+                    # Wrap in chat template if not already
+                    if not prompt.startswith("<|im_start|>"):
+                        prompt = f"<|im_start|>system\n{prompt}\n<|im_end|>\n<|im_start|>assistant\n"
+                    prompts.append({"prompt": prompt})
+                    continue
+                
+                # Format 2: Trace format (from traces.processed.jsonl)
+                trace = item.get("trace", "")
                 if "<|im_start|>assistant" in trace:
                     prompt_part = trace.split("<|im_start|>assistant")[0]
                     prompt_part += "<|im_start|>assistant\n"
                     prompts.append({"prompt": prompt_part})
-            except:
-                pass
+            except Exception as e:
+                pass  # Skip malformed lines
     
     print(f"Loaded {len(prompts)} prompts from {data_path}")
     return prompts
