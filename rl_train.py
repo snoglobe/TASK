@@ -1786,8 +1786,11 @@ def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs
         if _is_main_process and _reward_fn.judge and random.random() < _reward_fn.judge_rate:
             try:
                 judge_score, judge_breakdown = _reward_fn.judge.judge(prompt, completion)
+                if _dashboard:
+                    _dashboard.log(f"[Judge] Score: {judge_score:.2f}")
             except Exception as e:
-                print(f"[Judge] Error: {e}")
+                if _dashboard:
+                    _dashboard.log(f"[Judge] Error: {e}")
                 judge_score = None
         
         # Compute final reward
@@ -1953,11 +1956,17 @@ def main():
     
     args = parser.parse_args()
     
-    # Helper to only print on main process
+    # Helper to only print on main process (routes to dashboard if active)
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    def log(msg):
+    def log(msg, force_print=False):
+        global _dashboard
         if local_rank == 0:
-            print(msg)
+            # Always print before dashboard is created, or if force_print
+            if _dashboard is None or force_print:
+                print(msg)
+            # Also log to dashboard if it exists
+            if _dashboard is not None:
+                _dashboard.log(str(msg))
     
     config = RLConfig(
         model_path=args.model,

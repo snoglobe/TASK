@@ -116,14 +116,15 @@ class RewardGraph:
 class TrainingDashboard:
     """Rich TUI dashboard for RL training visualization."""
     
-    def __init__(self, max_logs: int = 50):
+    def __init__(self, max_logs: int = 50, max_console_logs: int = 100):
         if not RICH_AVAILABLE:
             raise ImportError("rich library required. Install with: pip install rich")
         
         self.console = Console()
         self.logs: deque[GenerationLog] = deque(maxlen=max_logs)
-        self.reward_graph = RewardGraph(width=58)
-        self.judge_graph = RewardGraph(width=58)
+        self.console_logs: deque[str] = deque(maxlen=max_console_logs)  # For log messages
+        self.reward_graph = RewardGraph(width=40)
+        self.judge_graph = RewardGraph(width=40)
         
         # Training stats
         self.step = 0
@@ -163,13 +164,14 @@ class TrainingDashboard:
         # Fixed heights prevent layout shifts
         layout.split_column(
             Layout(name="header", size=3),
-            Layout(name="main", size=30),  # Fixed height for main content
+            Layout(name="main", size=25),  # Main content
+            Layout(name="logs", size=12),  # Log box
             Layout(name="footer", size=3),
         )
         
         layout["main"].split_row(
-            Layout(name="stats", size=45),  # Fixed width for stats
-            Layout(name="flow"),  # Flow takes remaining space
+            Layout(name="stats", size=50),  # Fixed width for stats
+            Layout(name="flow"),  # Latest completion takes remaining space
         )
         
         return layout
@@ -203,23 +205,34 @@ class TrainingDashboard:
         stats_table.add_row("Loss", f"{self.loss:.4f}")
         stats_table.add_row("Reward Mean", f"{self.reward_mean:.2f}")
         
+        # Recent scores (last 10)
+        recent_section = Text()
+        recent_section.append("\nRecent Scores: ", style="bold")
+        recent_scores = [log.verifier_score for log in list(self.logs)[-10:]]
+        for score in recent_scores:
+            color = "green" if score > 1.5 else ("yellow" if score > 0 else "red")
+            recent_section.append(f"{score:.1f} ", style=color)
+        
         # Reward graph
         r_min, r_max, r_mean, r_count = self.reward_graph.stats()
         reward_section = Text()
-        reward_section.append("Verifier Reward", style="bold yellow")
-        reward_section.append(f" (n={r_count} mean:{r_mean:.2f} range:[{r_min:.1f},{r_max:.1f}])\n", style="dim")
+        reward_section.append("\n\nVerifier Reward", style="bold yellow")
+        reward_section.append(f" (n={r_count})\n", style="dim")
+        reward_section.append(f"mean:{r_mean:.2f} range:[{r_min:.1f},{r_max:.1f}]\n", style="dim")
         reward_section.append(self.reward_graph.render(), style="green")
         
-        # Judge graph
-        j_min, j_max, j_mean, j_count = self.judge_graph.stats()
+        # Judge graph (only if we have judge calls)
         judge_section = Text()
-        judge_section.append("\n\nJudge Score", style="bold magenta")
-        judge_section.append(f" (n={j_count} mean:{j_mean:.2f} range:[{j_min:.1f},{j_max:.1f}])\n", style="dim")
-        judge_section.append(self.judge_graph.render(), style="magenta")
+        if self.judge_calls > 0:
+            j_min, j_max, j_mean, j_count = self.judge_graph.stats()
+            judge_section.append("\n\nJudge Score", style="bold magenta")
+            judge_section.append(f" (n={j_count})\n", style="dim")
+            judge_section.append(f"mean:{j_mean:.2f} range:[{j_min:.1f},{j_max:.1f}]\n", style="dim")
+            judge_section.append(self.judge_graph.render(), style="magenta")
         
         content = Group(
             stats_table,
-            Text("\n"),
+            recent_section,
             reward_section,
             judge_section,
         )
@@ -227,51 +240,99 @@ class TrainingDashboard:
         return Panel(content, title="[bold]📊 Statistics[/]", border_style="blue", box=ROUNDED)
     
     def _render_flow(self) -> Panel:
-        """Render the generation flow panel."""
+        """Render the latest completion panel."""
         if not self.logs:
             return Panel(
                 "[dim]Waiting for generations...[/]",
-                title="[bold]🔄 Generation Flow[/]",
+                title="[bold]🔄 Latest Completion[/]",
                 border_style="green",
                 box=ROUNDED,
             )
         
-        # Show last few logs
-        content = []
-        for log in list(self.logs)[-5:]:  # Show last 5
-            entry = Text()
-            
-            # Step header
-            entry.append(f"─── Step {log.step} ", style="bold cyan")
-            entry.append("─" * 30 + "\n", style="dim")
-            
-            # Prompt
-            entry.append("📝 Prompt: ", style="bold yellow")
-            entry.append(f"{self._truncate(log.prompt_preview, 100)}\n", style="dim")
-            
-            # Output
-            entry.append("🤖 Output: ", style="bold green")
-            entry.append(f"{self._truncate(log.output_preview, 150)}\n", style="white")
-            
-            # Verifier
-            v_color = "green" if log.verifier_score > 1.5 else ("yellow" if log.verifier_score > 0 else "red")
-            entry.append("✓ Verifier: ", style="bold blue")
-            entry.append(f"{log.verifier_score:.2f} ", style=f"bold {v_color}")
-            entry.append(f"[{self._format_breakdown(log.verifier_breakdown)}]\n", style="dim")
-            
-            # Judge (if available)
-            if log.judge_score is not None:
-                j_color = "green" if log.judge_score > 0.7 else ("yellow" if log.judge_score > 0.4 else "red")
-                entry.append("⚖️ Judge: ", style="bold magenta")
-                entry.append(f"{log.judge_score:.2f}\n", style=f"bold {j_color}")
-            
-            entry.append("\n")
-            content.append(entry)
+        # Get the latest log
+        latest = self.logs[-1]
+        
+        content = Text()
+        
+        # Header with step and scores
+        v_color = "green" if latest.verifier_score > 1.5 else ("yellow" if latest.verifier_score > 0 else "red")
+        content.append(f"Step {latest.step}", style="bold cyan")
+        content.append(f"  │  ", style="dim")
+        content.append(f"Verifier: {latest.verifier_score:.2f}", style=f"bold {v_color}")
+        if latest.judge_score is not None:
+            j_color = "green" if latest.judge_score > 0.7 else ("yellow" if latest.judge_score > 0.4 else "red")
+            content.append(f"  │  ", style="dim")
+            content.append(f"Judge: {latest.judge_score:.2f}", style=f"bold {j_color}")
+        content.append("\n")
+        content.append("─" * 60 + "\n", style="dim")
+        
+        # Prompt (truncated)
+        content.append("📝 ", style="bold yellow")
+        prompt_preview = latest.prompt_preview[:200].replace('\n', ' ')
+        content.append(f"{prompt_preview}...\n\n", style="dim")
+        
+        # Full output (or as much as fits)
+        content.append("🤖 Output:\n", style="bold green")
+        
+        # Show the completion - limit to ~25 lines to fit in panel
+        output_lines = latest.output_preview.split('\n')
+        max_lines = 22
+        if len(output_lines) > max_lines:
+            # Show first and last parts
+            shown = output_lines[:max_lines-2]
+            shown.append(f"... ({len(output_lines) - max_lines + 2} more lines) ...")
+            shown.extend(output_lines[-1:])
+            output_text = '\n'.join(shown)
+        else:
+            output_text = latest.output_preview
+        
+        content.append(output_text, style="white")
+        
+        # Reward breakdown at bottom
+        content.append("\n\n")
+        content.append("─" * 60 + "\n", style="dim")
+        breakdown_str = self._format_breakdown(latest.verifier_breakdown)
+        content.append(f"Breakdown: {breakdown_str}", style="dim")
         
         return Panel(
-            Group(*content) if content else Text(""),
-            title="[bold]🔄 Generation Flow[/]",
+            content,
+            title=f"[bold]🔄 Latest Completion ({self.generations} total)[/]",
             border_style="green",
+            box=ROUNDED,
+        )
+    
+    def _render_logs(self) -> Panel:
+        """Render the log box panel."""
+        if not self.console_logs:
+            content = Text("[dim]No logs yet...[/]")
+        else:
+            content = Text()
+            # Show last N logs that fit
+            for log_line in list(self.console_logs)[-10:]:
+                # Color based on content
+                if "[ERROR]" in log_line or "Error" in log_line:
+                    style = "red"
+                elif "[WARN]" in log_line or "Warning" in log_line:
+                    style = "yellow"
+                elif "[Judge]" in log_line:
+                    style = "magenta"
+                elif "[Reward]" in log_line:
+                    style = "green"
+                elif "✓" in log_line:
+                    style = "green"
+                elif "✗" in log_line:
+                    style = "red"
+                else:
+                    style = "dim"
+                
+                # Truncate long lines
+                display_line = log_line[:120] + "..." if len(log_line) > 120 else log_line
+                content.append(f"{display_line}\n", style=style)
+        
+        return Panel(
+            content,
+            title=f"[bold]📋 Logs ({len(self.console_logs)})[/]",
+            border_style="yellow",
             box=ROUNDED,
         )
     
@@ -281,9 +342,12 @@ class TrainingDashboard:
         footer.append("  Press ", style="dim")
         footer.append("Ctrl+C", style="bold yellow")
         footer.append(" to stop  │  ", style="dim")
-        footer.append("Logs: ", style="dim")
+        footer.append("Samples: ", style="dim")
         footer.append(f"{len(self.logs)}", style="cyan")
         footer.append(f"/{self.logs.maxlen}", style="dim")
+        footer.append("  │  ", style="dim")
+        footer.append("Logs: ", style="dim")
+        footer.append(f"{len(self.console_logs)}", style="cyan")
         
         return Panel(footer, box=ROUNDED, style="dim")
     
@@ -295,6 +359,7 @@ class TrainingDashboard:
             layout["header"].update(self._render_header())
             layout["stats"].update(self._render_stats())
             layout["flow"].update(self._render_flow())
+            layout["logs"].update(self._render_logs())
             layout["footer"].update(self._render_footer())
         
         return layout
@@ -388,6 +453,12 @@ class TrainingDashboard:
                 self.reward_mean = reward_mean
         
         # Don't call update() - let Live's auto-refresh handle it
+    
+    def log(self, message: str):
+        """Add a log message to the log box."""
+        timestamp = time.strftime("%H:%M:%S")
+        with self._lock:
+            self.console_logs.append(f"[{timestamp}] {message}")
 
 
 # =============================================================================
