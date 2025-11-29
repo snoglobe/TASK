@@ -1768,9 +1768,16 @@ def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs
     """Wrapper for GRPO trainer compatibility with dashboard logging."""
     global _reward_fn, _dashboard, _step_counter, _is_main_process
     
+    # DEBUG: Print when reward function is called
+    print(f"[DEBUG] reward_function_wrapper called with {len(completions)} completions", flush=True)
+    if completions:
+        print(f"[DEBUG] First completion length: {len(completions[0])} chars", flush=True)
+        print(f"[DEBUG] First completion preview: {completions[0][:200]}...", flush=True)
+    
     verifier = TaskVerifier()
     
     if _reward_fn is None:
+        print("[DEBUG] _reward_fn is None, using basic verifier", flush=True)
         # Fallback to basic verifier if not initialized
         return [verifier.compute_reward(c)[0] for c in completions]
     
@@ -2099,12 +2106,20 @@ def main():
     
     # Train
     log("\nStarting GRPO training...")
+    print(f"[DEBUG] Dataset size: {len(dataset)}", flush=True)
+    print(f"[DEBUG] Num epochs: {config.num_train_epochs}", flush=True)
+    print(f"[DEBUG] Batch size: {config.per_device_train_batch_size}", flush=True)
+    print(f"[DEBUG] Num generations: {config.num_generations}", flush=True)
+    print(f"[DEBUG] Max new tokens: {config.max_new_tokens}", flush=True)
     
     # Start dashboard
     total_steps = len(dataset) * config.num_train_epochs
+    print(f"[DEBUG] Total steps: {total_steps}", flush=True)
     if _dashboard:
         _dashboard.start(total_steps=total_steps)
+        print("[DEBUG] Dashboard started", flush=True)
     
+    print("[DEBUG] Calling trainer.train()...", flush=True)
     try:
         trainer.train()
     except KeyboardInterrupt:
