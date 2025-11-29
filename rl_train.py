@@ -1815,15 +1815,11 @@ def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs
     for idx, (prompt, completion) in enumerate(zip(prompts, completions)):
         t_comp = time.time()
         
-        # First, truncate at stop sequences if the model produced them
-        # (vLLM might not be respecting stop sequences)
-        for stop_seq in ["<|im_end|>", "<|endoftext|>", "<|im_start|>"]:
-            if stop_seq in completion:
-                stop_idx = completion.find(stop_seq)
-                if stop_idx > 0:
-                    completion = completion[:stop_idx]
-                    print(f"[DEBUG] Completion {idx}: truncated at {stop_seq} (pos {stop_idx})", flush=True)
-                    break
+        # If completion is extremely long (didn't stop), give penalty without parsing
+        if len(completion) > 100000:
+            print(f"[DEBUG] Completion {idx}: {len(completion)} chars - too long, skipping parse, penalty", flush=True)
+            rewards.append(-3.0)  # Max penalty for runaway generation
+            continue
         
         # Truncate completion for parsing if too long (saves time, garbage after response anyway)
         # Look for the last 'response' block and truncate after it
