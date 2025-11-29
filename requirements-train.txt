@@ -12,3 +12,4 @@ tensorboard
 wandb  # optional, for experiment tracking
 rich>=13.0.0  # For training dashboard TUI
 
+git+https://github.com/PrimeIntellect-ai/prime-rl.git

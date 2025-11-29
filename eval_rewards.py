@@ -29,7 +29,7 @@ import sys
 from pathlib import Path
 
 # Import from rl_train
-from rl_train import TaskVerifier, TaskParser, LLMJudge, OPENAI_AVAILABLE
+from task_format import TaskVerifier, TaskParser, LLMJudge, OPENAI_AVAILABLE
 
 
 def print_verifier_results(trace: str, verbose: bool = False):

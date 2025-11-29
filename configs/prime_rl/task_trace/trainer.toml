@@ -1,0 +1,20 @@
+max_steps = 200
+
+[model]
+name = "Qwen/Qwen3-4B"
+dtype = "bfloat16"
+
+[optim]
+lr = 1e-6
+weight_decay = 0.01
+
+[buffer]
+batch_size = 128
+seq_len = 4096
+online_difficulty_filtering = true
+easy_fraction = 0.2
+hard_fraction = 0.2
+
+[checkpoint]
+interval = 20
+

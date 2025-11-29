@@ -1,0 +1,6 @@
+[model]
+name = "Qwen/Qwen3-4B"
+
+[server]
+port = 8000
+

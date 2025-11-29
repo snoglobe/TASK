@@ -1,0 +1,17 @@
+batch_size = 128
+rollouts_per_example = 8
+seq_len = 4096
+max_steps = 200
+
+[model]
+name = "Qwen/Qwen3-4B"
+
+[sampling]
+max_tokens = 4096
+temperature = 0.8
+stop = ["<|im_end|>", "<|endoftext|>"]
+
+[[env]]
+id = "task-trace"
+args = { data_path = "traces.processed.jsonl", max_trace_chars = 50000 }
+
