@@ -1766,13 +1766,16 @@ _is_main_process = True  # Set in main()
 
 def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs) -> list[float]:
     """Wrapper for GRPO trainer compatibility with dashboard logging."""
+    import time
     global _reward_fn, _dashboard, _step_counter, _is_main_process
     
     # DEBUG: Print when reward function is called
-    print(f"[DEBUG] reward_function_wrapper called with {len(completions)} completions", flush=True)
+    t0 = time.time()
+    print(f"\n[DEBUG] ===== REWARD FUNCTION CALLED =====", flush=True)
+    print(f"[DEBUG] Num completions: {len(completions)}", flush=True)
     if completions:
-        print(f"[DEBUG] First completion length: {len(completions[0])} chars", flush=True)
-        print(f"[DEBUG] First completion preview: {completions[0][:200]}...", flush=True)
+        print(f"[DEBUG] Completion lengths (chars): {[len(c) for c in completions]}", flush=True)
+        print(f"[DEBUG] First 300 chars of completion 0:\n{completions[0][:300]}", flush=True)
     
     verifier = TaskVerifier()
     
@@ -1820,6 +1823,8 @@ def reward_function_wrapper(completions: list[str], prompts: list[str], **kwargs
                 judge_score=judge_score,
             )
     
+    print(f"[DEBUG] Reward computation took {time.time() - t0:.2f}s", flush=True)
+    print(f"[DEBUG] Rewards: {rewards}", flush=True)
     return rewards
 
 
@@ -2074,6 +2079,11 @@ def main():
     dataset = Dataset.from_list(prompts)
     
     # GRPO config
+    # Note: For multi-GPU, FSDP + generation is extremely slow.
+    # Options:
+    # 1. Use single GPU (model fits on one H200)
+    # 2. Use use_vllm=True for fast generation with separate vLLM process
+    # 3. Use DeepSpeed ZeRO-2 (keeps full model for inference)
     grpo_config = GRPOConfig(
         output_dir=config.output_dir,
         num_train_epochs=config.num_train_epochs,
@@ -2087,6 +2097,8 @@ def main():
         num_generations=config.num_generations,
         temperature=config.temperature,
         report_to="tensorboard",
+        # Reduce sync overhead - log less frequently
+        logging_first_step=True,
     )
     
     # Trainer callbacks
