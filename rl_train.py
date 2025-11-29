@@ -35,6 +35,7 @@ import math
 import os
 import random
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -47,10 +48,19 @@ from trl import GRPOConfig, GRPOTrainer
 
 # Optional backends for LLM judge
 try:
-    from openai import OpenAI
+    from openai import (
+        OpenAI,
+        APIConnectionError,
+        APITimeoutError,
+        RateLimitError,
+        BadRequestError,
+        APIError,
+    )
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
+    OpenAI = None  # type: ignore
+    APIConnectionError = APITimeoutError = RateLimitError = BadRequestError = APIError = Exception  # type: ignore
 
 try:
     from vllm import LLM, SamplingParams
@@ -869,20 +879,30 @@ class LLMJudge:
         gpu_memory_utilization: float = 0.9,
         dtype: str = "bfloat16",  # "bfloat16", "float16", "auto"
         server_url: Optional[str] = None,  # For vllm_server backend
+        timeout: float = 30.0,
+        max_completion_chars: int = 4000,
+        max_retries: int = 1,
     ):
         self.model = model
         self.backend = backend
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.timeout = timeout if timeout and timeout > 0 else None
+        self.max_completion_chars = max_completion_chars if max_completion_chars and max_completion_chars > 0 else 4000
+        self.max_retries = max(0, max_retries)
         
         # Stats
         self.calls = 0
         self.cache_hits = 0
         
+        client_kwargs = {}
+        if self.timeout is not None:
+            client_kwargs["timeout"] = self.timeout
+        
         if backend == "openai":
             if not OPENAI_AVAILABLE:
                 raise ImportError("openai package required. Install with: pip install openai")
-            self.client = OpenAI(api_key=api_key) if api_key else OpenAI()
+            self.client = OpenAI(api_key=api_key, **client_kwargs) if api_key else OpenAI(**client_kwargs)
             self._llm = None
         
         elif backend == "vllm_server":
@@ -891,7 +911,11 @@ class LLMJudge:
                 raise ImportError("openai package required for vllm_server backend")
             base_url = server_url or "http://localhost:8100/v1"
             print(f"[Judge] Connecting to vLLM server at {base_url}")
-            self.client = OpenAI(base_url=base_url, api_key="not-needed")
+            self.client = OpenAI(
+                base_url=base_url,
+                api_key=api_key or "not-needed",
+                **client_kwargs,
+            )
             self._llm = None
             self._sampling_params = None
             print(f"[Judge] Connected to vLLM server (model: {model})")
@@ -977,6 +1001,12 @@ class LLMJudge:
             return match.group(1).strip()[:500]
         return prompt[-500:]  # Last resort
     
+    def _truncate_completion(self, completion: str) -> str:
+        """Trim completion before sending to judges to avoid huge payloads."""
+        if self.max_completion_chars and self.max_completion_chars > 0:
+            return completion[: self.max_completion_chars]
+        return completion
+    
     def _parse_json_response(self, text: str) -> dict:
         """Extract JSON from response, handling markdown code blocks."""
         # Try direct parse first
@@ -1005,20 +1035,42 @@ class LLMJudge:
     
     def _judge_openai(self, user_request: str, completion: str) -> dict:
         """Judge using OpenAI API."""
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
+        truncated = self._truncate_completion(completion)
+        request_kwargs = {
+            "model": self.model,
+            "messages": [
                 {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-                {"role": "user", "content": JUDGE_USER_TEMPLATE.format(
-                    user_request=user_request,
-                    response=completion[:4000]
-                )}
+                {
+                    "role": "user",
+                    "content": JUDGE_USER_TEMPLATE.format(
+                        user_request=user_request,
+                        response=truncated,
+                    ),
+                },
             ],
-            response_format={"type": "json_object"},
-            temperature=0.0,
-            max_tokens=256,
-        )
-        return json.loads(response.choices[0].message.content)
+            "response_format": {"type": "json_object"},
+            "temperature": 0.0,
+            "max_tokens": 256,
+        }
+        if self.timeout is not None:
+            request_kwargs["timeout"] = self.timeout
+        
+        attempts = self.max_retries + 1
+        last_error: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                response = self.client.chat.completions.create(**request_kwargs)
+                return json.loads(response.choices[0].message.content)
+            except (APITimeoutError, APIConnectionError, RateLimitError, BadRequestError, APIError) as exc:
+                last_error = exc
+                print(f"[Judge] OpenAI backend error (attempt {attempt}/{attempts}): {exc}")
+                if attempt < attempts:
+                    time.sleep(min(2 ** (attempt - 1), 8))
+                else:
+                    raise exc
+        if last_error:
+            raise last_error
+        raise RuntimeError("Unknown judge failure without exception")
     
     def _judge_vllm(self, user_request: str, completion: str) -> dict:
         """Judge using local vLLM model."""
@@ -1026,7 +1078,7 @@ class LLMJudge:
         prompt = f"""<|im_start|>system
 {JUDGE_SYSTEM_PROMPT}<|im_end|>
 <|im_start|>user
-{JUDGE_USER_TEMPLATE.format(user_request=user_request, response=completion[:4000])}<|im_end|>
+{JUDGE_USER_TEMPLATE.format(user_request=user_request, response=self._truncate_completion(completion))}<|im_end|>
 <|im_start|>assistant
 """
         outputs = self._llm.generate([prompt], self._sampling_params)
@@ -1100,7 +1152,7 @@ class LLMJudge:
                 results.append(None)  # Placeholder
                 uncached_indices.append(i)
                 user_request = self._extract_user_request(prompt)
-                uncached_requests.append((user_request, completion[:4000]))
+                uncached_requests.append((user_request, self._truncate_completion(completion)))
         
         if not uncached_requests:
             return results
@@ -1725,6 +1777,9 @@ class HybridRewardFunction:
         judge_dtype: str = "bfloat16",
         api_key: Optional[str] = None,
         server_url: Optional[str] = None,  # URL for vllm_server backend
+        judge_timeout: float = 30.0,
+        judge_max_chars: int = 4000,
+        judge_retries: int = 1,
     ):
         self.verifier = TaskVerifier()
         self.judge_rate = judge_rate
@@ -1739,6 +1794,9 @@ class HybridRewardFunction:
                 tensor_parallel_size=judge_gpus,
                 dtype=judge_dtype,
                 server_url=server_url,
+                timeout=judge_timeout,
+                max_completion_chars=judge_max_chars,
+                max_retries=judge_retries,
             )
     
     def __call__(
@@ -1991,6 +2049,9 @@ class RLConfig:
     judge_gpus: int = 6  # GPUs for judge model (when using vllm)
     judge_dtype: str = "bfloat16"  # "bfloat16", "float16", "auto"
     openai_api_key: Optional[str] = None
+    judge_timeout: float = 30.0  # Seconds to wait for judge backend
+    judge_max_chars: int = 4000  # Max chars from completion to send to judge
+    judge_retries: int = 1  # Retries for judge backend
     
     # Dynamic prompt generation
     generate_prompts: bool = False  # Generate prompts on-the-fly instead of using data file
@@ -2056,6 +2117,12 @@ def main():
                         help="Data type for judge model")
     parser.add_argument("--openai-api-key", type=str, default=None,
                         help="OpenAI API key (for openai backend)")
+    parser.add_argument("--judge-timeout", type=float, default=30.0,
+                        help="Seconds before judge request times out (vllm_server/openai)")
+    parser.add_argument("--judge-max-chars", type=int, default=4000,
+                        help="Maximum characters of a completion sent to the judge")
+    parser.add_argument("--judge-retries", type=int, default=1,
+                        help="Number of retries for judge calls after failure")
     
     # Note: For prompt generation, use generate_prompts.py separately
     # This avoids NCCL timeout issues during distributed training
@@ -2100,6 +2167,9 @@ def main():
         judge_gpus=args.judge_gpus,
         judge_dtype=args.judge_dtype,
         openai_api_key=args.openai_api_key,
+        judge_timeout=args.judge_timeout,
+        judge_max_chars=args.judge_max_chars,
+        judge_retries=args.judge_retries,
         max_trace_chars=args.max_trace_chars if args.max_trace_chars and args.max_trace_chars > 0 else None,
         allow_long_completions=args.allow_long_completions,
     )
@@ -2141,6 +2211,7 @@ def main():
         log(f"  Model: {config.judge_model}")
         log(f"  Judge rate: {config.judge_rate*100:.0f}% of samples")
         log(f"  Judge weight: {config.judge_weight}")
+        log(f"  Judge timeout: {config.judge_timeout}s (max chars {config.judge_max_chars}, retries {config.judge_retries})")
         if config.judge_backend == "vllm":
             log(f"  GPUs: {config.judge_gpus}")
             log(f"  Dtype: {config.judge_dtype}")
@@ -2175,17 +2246,39 @@ def main():
         judge_dtype=config.judge_dtype,
         api_key=config.openai_api_key,
         server_url=config.judge_url,
+        judge_timeout=config.judge_timeout,
+        judge_max_chars=config.judge_max_chars,
+        judge_retries=config.judge_retries,
     )
     
     # Load model and tokenizer
     log("\nLoading model...")
-    tokenizer = AutoTokenizer.from_pretrained(config.model_path, trust_remote_code=False)
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_path,
-        trust_remote_code=False,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-    )
+    tokenizer_kwargs = {"trust_remote_code": False}
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.model_path,
+            fix_mistral_regex=True,
+            **tokenizer_kwargs,
+        )
+    except TypeError:
+        tokenizer = AutoTokenizer.from_pretrained(config.model_path, **tokenizer_kwargs)
+    
+    model_kwargs = {
+        "trust_remote_code": False,
+        "attn_implementation": "flash_attention_2",
+    }
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_path,
+            dtype=torch.bfloat16,
+            **model_kwargs,
+        )
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_path,
+            torch_dtype=torch.bfloat16,
+            **model_kwargs,
+        )
     
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
