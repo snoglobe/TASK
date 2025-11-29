@@ -2143,7 +2143,7 @@ def main():
         vllm_gpu_memory_utilization=1 if use_vllm else None,
         vllm_server_port=config.vllm_port if use_vllm else None,
         # Stop sequences for TASK format
-        stop=["<|im_end|>", "<|endoftext|>"],
+        #stop=["<|im_end|>", "<|endoftext|>"],
     )
     
     if use_vllm:
